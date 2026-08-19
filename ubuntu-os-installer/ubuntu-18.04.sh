@@ -4,12 +4,23 @@ set -Eeuo pipefail
 # ============================================================
 # Ubuntu 18.04 LTS Server Installer
 #
-# Run from Linux Rescue environments such as:
-#   - Rocky Linux Rescue
+# Supported rescue environments:
+#   - Rocky Linux Rescue 9
 #   - GRML Rescue
 #
-# Installs:
-#   Ubuntu 18.04 LTS (Bionic)
+# Target:
+#   - Ubuntu 18.04 LTS (Bionic Beaver)
+#
+# Features:
+#   - BIOS and UEFI support
+#   - Interactive target disk selection
+#   - Automatic network detection
+#   - Single ext4 root partition
+#   - Swapfile
+#   - SSH server
+#   - Static IPv4 configuration
+#   - GRUB bootloader
+#   - Works without dpkg-deb
 #
 # WARNING:
 #   The selected target disk will be COMPLETELY ERASED.
@@ -20,7 +31,6 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 OS_NAME="Ubuntu 18.04 LTS"
 CODENAME="bionic"
 
-# Ubuntu 18.04 is EOL.
 UBUNTU_MIRROR="http://old-releases.ubuntu.com/ubuntu"
 
 TARGET_MOUNT="/mnt/target"
@@ -33,25 +43,26 @@ TARGET_DISK=""
 ROOT_PART=""
 EFI_PART=""
 
+BOOT_MODE=""
 DEFAULT_IF=""
 DEFAULT_IP=""
 DEFAULT_PREFIX=""
-DEFAULT_GW=""
+DEFAULT_GATEWAY=""
 DEFAULT_MAC=""
 
-BOOT_MODE=""
+ROOT_UUID=""
+SWAP_SIZE="4G"
 
-trap 'echo; echo "ERROR: Installation stopped at line $LINENO."; exit 1' ERR
-
-
-# ============================================================
-# Basic functions
-# ============================================================
+log() {
+    echo
+    echo "============================================================"
+    echo "$1"
+    echo "============================================================"
+}
 
 die() {
     echo
-    echo "ERROR: $*"
-    echo
+    echo "ERROR: $*" >&2
     exit 1
 }
 
@@ -59,48 +70,78 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+cleanup() {
+    set +e
 
-# ============================================================
-# Root check
-# ============================================================
+    for mp in \
+        "$TARGET_MOUNT/dev/pts" \
+        "$TARGET_MOUNT/dev" \
+        "$TARGET_MOUNT/proc" \
+        "$TARGET_MOUNT/sys" \
+        "$TARGET_MOUNT/run"; do
 
-check_root() {
+        if mountpoint -q "$mp" 2>/dev/null; then
+            umount -lf "$mp" 2>/dev/null || true
+        fi
+    done
 
-    if [ "$(id -u)" -ne 0 ]; then
-        die "This installer must be run as root."
+    if mountpoint -q "$TARGET_MOUNT" 2>/dev/null; then
+        umount -lf "$TARGET_MOUNT" 2>/dev/null || true
     fi
 }
 
+trap cleanup EXIT
 
-# ============================================================
-# Detect Rescue environment
-# ============================================================
+check_commands() {
 
-detect_rescue_os() {
+    log "Checking required rescue commands"
 
-    echo
-    echo "============================================================"
-    echo " Rescue Environment"
-    echo "============================================================"
+    local cmds=(
+        awk
+        ar
+        bash
+        blkid
+        chroot
+        curl
+        find
+        grep
+        ip
+        lsblk
+        mount
+        parted
+        reboot
+        sed
+        tar
+        wipefs
+    )
 
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        echo "OS      : ${PRETTY_NAME:-Unknown}"
-        echo "Kernel  : $(uname -r)"
-    else
-        echo "OS      : Unknown"
+    local missing=()
+
+    for cmd in "${cmds[@]}"; do
+        if ! command_exists "$cmd"; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if [ "${#missing[@]}" -gt 0 ]; then
+        die "Missing commands: ${missing[*]}"
     fi
+
+    if ! command_exists mkfs.ext4; then
+        die "mkfs.ext4 is required."
+    fi
+
+    if ! command_exists mkfs.fat; then
+        echo "WARNING: mkfs.fat not found."
+        echo "UEFI installation may require dosfstools."
+    fi
+
+    echo "Required commands are available."
 }
-
-
-# ============================================================
-# Detect BIOS / UEFI
-# ============================================================
 
 detect_boot_mode() {
 
-    echo
-    echo "Detecting boot mode..."
+    log "Detecting boot mode"
 
     if [ -d /sys/firmware/efi ]; then
         BOOT_MODE="UEFI"
@@ -111,114 +152,17 @@ detect_boot_mode() {
     echo "Boot mode: $BOOT_MODE"
 }
 
-
-# ============================================================
-# Check Rescue tools
-# ============================================================
-
-check_tools() {
-
-    echo
-    echo "============================================================"
-    echo " Checking Rescue Tools"
-    echo "============================================================"
-
-    local required=(
-        bash
-        curl
-        tar
-        gzip
-        awk
-        sed
-        grep
-        mount
-        umount
-        chroot
-        lsblk
-        blkid
-        wipefs
-        parted
-        mkfs.ext4
-        ip
-    )
-
-    local missing=()
-
-    for cmd in "${required[@]}"; do
-        if command_exists "$cmd"; then
-            echo "[OK]      $cmd"
-        else
-            echo "[MISSING] $cmd"
-            missing+=("$cmd")
-        fi
-    done
-
-    if [ "${#missing[@]}" -eq 0 ]; then
-        echo
-        echo "All required Rescue tools are available."
-        return
-    fi
-
-    echo
-    echo "Missing tools: ${missing[*]}"
-
-    if command_exists dnf; then
-
-        echo "Attempting to install missing tools using DNF..."
-
-        dnf install -y \
-            curl \
-            tar \
-            gzip \
-            xz \
-            gawk \
-            grep \
-            util-linux \
-            parted \
-            e2fsprogs \
-            coreutils \
-            iproute
-
-    elif command_exists apt-get; then
-
-        echo "Attempting to install missing tools using APT..."
-
-        apt-get update
-
-        apt-get install -y \
-            curl \
-            tar \
-            gzip \
-            xz-utils \
-            gawk \
-            grep \
-            util-linux \
-            parted \
-            e2fsprogs \
-            coreutils \
-            iproute2
-
-    else
-        die "Cannot install missing Rescue tools automatically."
-    fi
-}
-
-
-# ============================================================
-# Detect network
-# ============================================================
-
 detect_network() {
 
-    echo
-    echo "============================================================"
-    echo " Detecting Network"
-    echo "============================================================"
+    log "Detecting network configuration"
 
-    DEFAULT_IF="$(ip -4 route show default | awk 'NR==1 {print $5}')"
+    DEFAULT_IF="$(
+        ip -4 route show default |
+        awk 'NR==1 {print $5}'
+    )"
 
     [ -n "$DEFAULT_IF" ] ||
-        die "Could not detect the interface carrying the default route."
+        die "Could not determine default network interface."
 
     DEFAULT_IP="$(
         ip -4 -o addr show dev "$DEFAULT_IF" |
@@ -232,97 +176,47 @@ detect_network() {
         cut -d/ -f2
     )"
 
-    DEFAULT_GW="$(
+    DEFAULT_GATEWAY="$(
         ip -4 route show default dev "$DEFAULT_IF" |
         awk 'NR==1 {print $3}'
     )"
 
-    DEFAULT_MAC="$(cat "/sys/class/net/$DEFAULT_IF/address")"
+    DEFAULT_MAC="$(
+        cat "/sys/class/net/$DEFAULT_IF/address"
+    )"
 
     [ -n "$DEFAULT_IP" ] ||
         die "Could not determine IPv4 address."
 
     [ -n "$DEFAULT_PREFIX" ] ||
-        die "Could not determine network prefix."
+        die "Could not determine IPv4 prefix."
 
-    [ -n "$DEFAULT_GW" ] ||
-        die "Could not determine gateway."
+    [ -n "$DEFAULT_GATEWAY" ] ||
+        die "Could not determine default gateway."
 
-    echo
     echo "Interface : $DEFAULT_IF"
     echo "MAC       : $DEFAULT_MAC"
     echo "IP        : $DEFAULT_IP"
     echo "Prefix    : /$DEFAULT_PREFIX"
-    echo "Gateway   : $DEFAULT_GW"
+    echo "Gateway   : $DEFAULT_GATEWAY"
 }
-
-
-# ============================================================
-# Prefix → Netmask
-# ============================================================
-
-prefix_to_netmask() {
-
-    local prefix="$1"
-    local mask=""
-    local octet
-
-    if [ "$prefix" -eq 0 ]; then
-        echo "0.0.0.0"
-        return
-    fi
-
-    for octet in 1 2 3 4; do
-
-        if [ "$prefix" -ge 8 ]; then
-            mask="${mask}255"
-            prefix=$((prefix - 8))
-
-        elif [ "$prefix" -gt 0 ]; then
-            mask="$mask$((256 - 2 ** (8 - prefix)))"
-            prefix=0
-
-        else
-            mask="${mask}0"
-        fi
-
-        if [ "$octet" -lt 4 ]; then
-            mask="${mask}."
-        fi
-    done
-
-    echo "$mask"
-}
-
-
-# ============================================================
-# Select installation disk
-# ============================================================
 
 select_target_disk() {
 
-    echo
-    echo "============================================================"
-    echo " Available Physical Disks"
-    echo "============================================================"
-    echo
+    log "Available physical disks"
 
-    lsblk -d -e 7 \
-        -o NAME,SIZE,TYPE,MODEL,SERIAL
+    lsblk -d -o NAME,SIZE,TYPE,MODEL,SERIAL
 
     echo
-    echo "Select the disk where Ubuntu 18.04 will be installed."
-    echo
-    echo "WARNING: EVERYTHING on the selected disk will be erased."
-    echo
-
     read -rp "Target disk (example: /dev/sda): " TARGET_DISK
+
+    [ -n "$TARGET_DISK" ] ||
+        die "No target disk selected."
 
     [ -b "$TARGET_DISK" ] ||
         die "$TARGET_DISK is not a valid block device."
 
     local disk_type
-
     disk_type="$(lsblk -dn -o TYPE "$TARGET_DISK")"
 
     [ "$disk_type" = "disk" ] ||
@@ -337,9 +231,7 @@ select_target_disk() {
     disk_serial="$(lsblk -dn -o SERIAL "$TARGET_DISK" | xargs)"
 
     echo
-    echo "============================================================"
-    echo " Selected Installation Disk"
-    echo "============================================================"
+    echo "Selected disk:"
     echo
     echo "Device : $TARGET_DISK"
     echo "Size   : $disk_size"
@@ -347,158 +239,166 @@ select_target_disk() {
     echo "Serial : $disk_serial"
     echo
 
-    echo "ALL DATA ON THIS DISK WILL BE DESTROYED."
+    echo "WARNING: ALL DATA ON $TARGET_DISK WILL BE DESTROYED."
     echo
 
-    read -rp "Type INSTALL to continue: " confirmation
+    read -rp "Type WIPE to continue: " confirm
 
-    [ "$confirmation" = "INSTALL" ] ||
-        die "Installation cancelled."
-}
+    [ "$confirm" = "WIPE" ] ||
+        die "Disk wipe cancelled."
 
+    if lsblk -nr -o MOUNTPOINT "$TARGET_DISK" |
+        grep -qE '.+'; then
 
-# ============================================================
-# Check target disk
-# ============================================================
-
-check_target_disk() {
-
-    echo
-    echo "Checking target disk..."
-
-    local mounted
-
-    mounted="$(
-        lsblk -nr -o MOUNTPOINT "$TARGET_DISK" |
-        grep -v '^$' || true
-    )"
-
-    if [ -n "$mounted" ]; then
-        echo
-        lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$TARGET_DISK"
-        die "Target disk has mounted filesystems."
+        die "One or more partitions on $TARGET_DISK are mounted."
     fi
-
-    echo "[OK] Target disk is not mounted."
 }
-
-
-# ============================================================
-# Download / install debootstrap
-# ============================================================
 
 install_debootstrap() {
 
+    log "Installing debootstrap"
+
     if command_exists debootstrap; then
-
-        echo
         echo "debootstrap already available."
-
         debootstrap --version || true
-
         return
     fi
-
-    echo
-    echo "============================================================"
-    echo " Installing debootstrap"
-    echo "============================================================"
 
     mkdir -p "$WORK_DIR"
 
     local deb="$WORK_DIR/debootstrap.deb"
 
-    echo "Downloading:"
+    echo "Downloading debootstrap:"
     echo "$DEBOOTSTRAP_URL"
-    echo
 
-    curl -fL --retry 3 \
+    curl -fL \
+        --retry 3 \
+        --connect-timeout 15 \
         "$DEBOOTSTRAP_URL" \
-        -o "$deb"
-
-    [ -s "$deb" ] ||
+        -o "$deb" ||
         die "Failed to download debootstrap package."
 
-    echo
-    echo "Extracting debootstrap package..."
-
     rm -rf "$WORK_DIR/debootstrap-extract"
-
     mkdir -p "$WORK_DIR/debootstrap-extract"
 
     if command_exists dpkg-deb; then
 
-        dpkg-deb -x "$deb" "$WORK_DIR/debootstrap-extract"
+        echo "Using dpkg-deb for extraction."
+
+        dpkg-deb -x \
+            "$deb" \
+            "$WORK_DIR/debootstrap-extract"
 
     else
 
-        mkdir -p "$WORK_DIR/deb-control"
+        echo "dpkg-deb not available."
+        echo "Using ar + tar extraction."
 
-        cd "$WORK_DIR/deb-control"
+        local deb_extract="$WORK_DIR/deb-extract"
 
-        ar x "$deb"
+        rm -rf "$deb_extract"
+        mkdir -p "$deb_extract"
 
-        mkdir -p "$WORK_DIR/data"
+        (
+            cd "$deb_extract"
 
-        tar -xf data.tar.* \
-            -C "$WORK_DIR/data"
+            ar x "$deb"
 
-        cp -a "$WORK_DIR/data/usr/sbin/debootstrap" \
-            "$WORK_DIR/debootstrap-extract/" \
-            2>/dev/null || true
+            local data_archive
 
-        mkdir -p "$WORK_DIR/debootstrap-extract/usr/sbin"
+            data_archive="$(
+                find . -maxdepth 1 -type f \
+                \( \
+                    -name 'data.tar' \
+                    -o -name 'data.tar.gz' \
+                    -o -name 'data.tar.xz' \
+                    -o -name 'data.tar.bz2' \
+                    -o -name 'data.tar.zst' \
+                \) |
+                head -n1
+            )"
 
-        cp -a "$WORK_DIR/data/usr/sbin/debootstrap" \
-            "$WORK_DIR/debootstrap-extract/usr/sbin/"
+            [ -n "$data_archive" ] ||
+                die "Could not find data archive inside debootstrap package."
+
+            case "$data_archive" in
+
+                *.tar)
+                    tar -xf "$data_archive" \
+                        -C "$WORK_DIR/debootstrap-extract"
+                    ;;
+
+                *.tar.gz)
+                    tar -xzf "$data_archive" \
+                        -C "$WORK_DIR/debootstrap-extract"
+                    ;;
+
+                *.tar.xz)
+                    tar -xJf "$data_archive" \
+                        -C "$WORK_DIR/debootstrap-extract"
+                    ;;
+
+                *.tar.bz2)
+                    tar -xjf "$data_archive" \
+                        -C "$WORK_DIR/debootstrap-extract"
+                    ;;
+
+                *.tar.zst)
+                    if tar --help 2>&1 | grep -q -- '--zstd'; then
+                        tar --zstd -xf "$data_archive" \
+                            -C "$WORK_DIR/debootstrap-extract"
+                    else
+                        die "tar does not support zstd extraction."
+                    fi
+                    ;;
+
+                *)
+                    die "Unsupported data archive: $data_archive"
+                    ;;
+            esac
+        )
     fi
 
-    if [ ! -f "$WORK_DIR/debootstrap-extract/usr/sbin/debootstrap" ]; then
+    if [ ! -f \
+        "$WORK_DIR/debootstrap-extract/usr/sbin/debootstrap" ]; then
+
         die "Could not extract debootstrap."
     fi
 
-    cp "$WORK_DIR/debootstrap-extract/usr/sbin/debootstrap" \
-        /usr/local/sbin/debootstrap
+    rm -rf /usr/local/share/debootstrap
+    mkdir -p /usr/local/share
 
-    chmod 755 /usr/local/sbin/debootstrap
-
-    # Copy supporting files if available.
-    if [ -d "$WORK_DIR/debootstrap-extract/usr/share/debootstrap" ]; then
-
-        rm -rf /usr/local/share/debootstrap
-
-        mkdir -p /usr/local/share
+    if [ -d \
+        "$WORK_DIR/debootstrap-extract/usr/share/debootstrap" ]; then
 
         cp -a \
             "$WORK_DIR/debootstrap-extract/usr/share/debootstrap" \
             /usr/local/share/
     fi
 
-    echo
-    echo "debootstrap installed."
+    cp \
+        "$WORK_DIR/debootstrap-extract/usr/sbin/debootstrap" \
+        /usr/local/sbin/debootstrap
+
+    chmod 755 /usr/local/sbin/debootstrap
 
     debootstrap --version || true
+
+    echo "debootstrap installed successfully."
 }
-
-
-# ============================================================
-# Partition disk
-# ============================================================
 
 partition_disk() {
 
-    echo
-    echo "============================================================"
-    echo " Partitioning $TARGET_DISK"
-    echo "============================================================"
+    log "Partitioning $TARGET_DISK"
 
     wipefs -a "$TARGET_DISK"
 
     if [ "$BOOT_MODE" = "UEFI" ]; then
 
-        echo "Creating GPT partition table for UEFI..."
+        echo "Creating GPT partition table."
 
-        parted -s "$TARGET_DISK" mklabel gpt
+        parted -s "$TARGET_DISK" \
+            mklabel gpt
 
         parted -s "$TARGET_DISK" \
             mkpart ESP fat32 1MiB 513MiB
@@ -507,7 +407,7 @@ partition_disk() {
             set 1 esp on
 
         parted -s "$TARGET_DISK" \
-            mkpart root ext4 513MiB 100%
+            mkpart primary ext4 513MiB 100%
 
         if [[ "$TARGET_DISK" == /dev/nvme* ]]; then
             EFI_PART="${TARGET_DISK}p1"
@@ -519,11 +419,11 @@ partition_disk() {
 
     else
 
-        echo "Creating GPT partition table for BIOS..."
+        echo "Creating GPT partition table for BIOS."
 
-        parted -s "$TARGET_DISK" mklabel gpt
+        parted -s "$TARGET_DISK" \
+            mklabel gpt
 
-        # BIOS Boot Partition.
         parted -s "$TARGET_DISK" \
             mkpart bios_grub 1MiB 3MiB
 
@@ -531,7 +431,7 @@ partition_disk() {
             set 1 bios_grub on
 
         parted -s "$TARGET_DISK" \
-            mkpart root ext4 3MiB 100%
+            mkpart primary ext4 3MiB 100%
 
         if [[ "$TARGET_DISK" == /dev/nvme* ]]; then
             ROOT_PART="${TARGET_DISK}p2"
@@ -540,7 +440,10 @@ partition_disk() {
         fi
     fi
 
-    sync
+    sleep 2
+
+    partprobe "$TARGET_DISK" 2>/dev/null || true
+
     sleep 2
 
     echo
@@ -548,162 +451,86 @@ partition_disk() {
 
     if [ "$BOOT_MODE" = "UEFI" ]; then
 
-        echo
-        echo "Formatting EFI partition..."
+        [ -b "$EFI_PART" ] ||
+            die "EFI partition was not created."
 
+        echo "Formatting EFI partition:"
         mkfs.fat -F32 "$EFI_PART"
 
     fi
 
-    echo
-    echo "Formatting root partition..."
+    [ -b "$ROOT_PART" ] ||
+        die "Root partition was not created."
 
+    echo "Formatting root partition:"
     mkfs.ext4 -F -L rootfs "$ROOT_PART"
 
-    sync
+    ROOT_UUID="$(
+        blkid -s UUID -o value "$ROOT_PART"
+    )"
+
+    [ -n "$ROOT_UUID" ] ||
+        die "Could not obtain root filesystem UUID."
+
+    echo
+    echo "Root UUID: $ROOT_UUID"
 }
-
-
-# ============================================================
-# Mount target
-# ============================================================
 
 mount_target() {
 
-    echo
-    echo "Mounting target filesystem..."
+    log "Mounting target filesystem"
 
     mkdir -p "$TARGET_MOUNT"
 
     mount "$ROOT_PART" "$TARGET_MOUNT"
 
-    mountpoint -q "$TARGET_MOUNT" ||
-        die "Could not mount root filesystem."
-
-    if [ "$BOOT_MODE" = "UEFI" ]; then
-
-        mkdir -p "$TARGET_MOUNT/boot/efi"
-
-        mount "$EFI_PART" "$TARGET_MOUNT/boot/efi"
-    fi
+    mkdir -p \
+        "$TARGET_MOUNT/dev" \
+        "$TARGET_MOUNT/dev/pts" \
+        "$TARGET_MOUNT/proc" \
+        "$TARGET_MOUNT/sys" \
+        "$TARGET_MOUNT/run"
 }
-
-
-# ============================================================
-# Run debootstrap
-# ============================================================
 
 run_debootstrap() {
 
-    echo
-    echo "============================================================"
-    echo " Installing Ubuntu 18.04"
-    echo "============================================================"
-    echo
+    log "Installing Ubuntu 18.04 base system"
 
     debootstrap \
         --arch=amd64 \
+        --variant=minbase \
         "$CODENAME" \
         "$TARGET_MOUNT" \
         "$UBUNTU_MIRROR"
-
-    echo
-    echo "Ubuntu base system installed."
 }
 
+configure_target() {
 
-# ============================================================
-# Bind Rescue filesystems
-# ============================================================
+    log "Configuring installed Ubuntu system"
 
-bind_mounts() {
-
-    echo
-    echo "Preparing chroot environment..."
-
-    mount --rbind /dev "$TARGET_MOUNT/dev"
-    mount --make-rslave "$TARGET_MOUNT/dev"
-
-    mount --rbind /proc "$TARGET_MOUNT/proc"
-    mount --make-rslave "$TARGET_MOUNT/proc"
-
-    mount --rbind /sys "$TARGET_MOUNT/sys"
-    mount --make-rslave "$TARGET_MOUNT/sys"
-
-    if [ -d /run ]; then
-
-        mount --rbind /run "$TARGET_MOUNT/run"
-        mount --make-rslave "$TARGET_MOUNT/run"
-    fi
-
-    rm -f "$TARGET_MOUNT/etc/resolv.conf"
+    mount --bind /dev "$TARGET_MOUNT/dev"
+    mount --bind /dev/pts "$TARGET_MOUNT/dev/pts"
+    mount -t proc proc "$TARGET_MOUNT/proc"
+    mount -t sysfs sys "$TARGET_MOUNT/sys"
+    mount --bind /run "$TARGET_MOUNT/run"
 
     cp -L /etc/resolv.conf \
         "$TARGET_MOUNT/etc/resolv.conf"
-}
-
-
-# ============================================================
-# Configure Ubuntu
-# ============================================================
-
-configure_ubuntu() {
-
-    echo
-    echo "============================================================"
-    echo " Configuring Ubuntu 18.04"
-    echo "============================================================"
-
-    local root_uuid
-    root_uuid="$(blkid -s UUID -o value "$ROOT_PART")"
-
-    [ -n "$root_uuid" ] ||
-        die "Could not determine root filesystem UUID."
-
-    local netmask
-    netmask="$(prefix_to_netmask "$DEFAULT_PREFIX")"
-
-    echo
-    echo "Root UUID : $root_uuid"
-    echo "Netmask   : $netmask"
-
-    if [ "$BOOT_MODE" = "UEFI" ]; then
-
-        local efi_uuid
-        efi_uuid="$(blkid -s UUID -o value "$EFI_PART")"
-
-        cat > "$TARGET_MOUNT/etc/fstab" <<EOF
-UUID=$root_uuid / ext4 errors=remount-ro 0 1
-UUID=$efi_uuid /boot/efi vfat umask=0077 0 1
-EOF
-
-    else
-
-        cat > "$TARGET_MOUNT/etc/fstab" <<EOF
-UUID=$root_uuid / ext4 errors=remount-ro 0 1
-EOF
-
-    fi
 
     cat > "$TARGET_MOUNT/etc/apt/sources.list" <<EOF
-deb http://old-releases.ubuntu.com/ubuntu/ bionic main restricted universe multiverse
-deb http://old-releases.ubuntu.com/ubuntu/ bionic-updates main restricted universe multiverse
-deb http://old-releases.ubuntu.com/ubuntu/ bionic-security main restricted universe multiverse
+deb $UBUNTU_MIRROR $CODENAME main restricted universe multiverse
+deb $UBUNTU_MIRROR ${CODENAME}-updates main restricted universe multiverse
+deb $UBUNTU_MIRROR ${CODENAME}-security main restricted universe multiverse
 EOF
 
-    cat > "$TARGET_MOUNT/etc/network/interfaces" <<EOF
-auto lo
-iface lo inet loopback
-
-auto $DEFAULT_IF
-iface $DEFAULT_IF inet static
-    address $DEFAULT_IP
-    netmask $netmask
-    gateway $DEFAULT_GW
-    dns-nameservers 8.8.8.8 1.1.1.1
+    cat > "$TARGET_MOUNT/etc/fstab" <<EOF
+UUID=$ROOT_UUID / ext4 errors=remount-ro 0 1
+/swapfile none swap sw 0 0
 EOF
 
-    echo "ubuntu-server" > "$TARGET_MOUNT/etc/hostname"
+    cat > "$TARGET_MOUNT/etc/hostname" <<EOF
+ubuntu-server
+EOF
 
     cat > "$TARGET_MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
@@ -712,357 +539,252 @@ EOF
 ::1 localhost ip6-localhost ip6-loopback
 EOF
 
+    mkdir -p "$TARGET_MOUNT/etc/network"
+
+    cat > "$TARGET_MOUNT/etc/network/interfaces" <<EOF
+auto lo
+iface lo inet loopback
+
+auto $DEFAULT_IF
+iface $DEFAULT_IF inet static
+    address $DEFAULT_IP
+    netmask $(python3 - <<PY
+import ipaddress
+print(ipaddress.IPv4Network("0.0.0.0/$DEFAULT_PREFIX").netmask)
+PY
+)
+    gateway $DEFAULT_GATEWAY
+    dns-nameservers 8.8.8.8 1.1.1.1
+EOF
+}
+
+install_packages() {
+
+    log "Installing required Ubuntu packages"
+
     chroot "$TARGET_MOUNT" /bin/bash <<'CHROOT'
-set -Eeuo pipefail
-
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
 export DEBIAN_FRONTEND=noninteractive
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 apt-get update
 
 apt-get install -y \
     linux-image-generic \
+    grub-pc \
     openssh-server \
-    sudo \
     ifupdown \
     net-tools \
     iproute2 \
-    ca-certificates
+    iputils-ping \
+    curl \
+    ca-certificates \
+    sudo \
+    vim \
+    bash-completion \
+    locales \
+    cloud-init
 
-systemctl enable ssh
-systemctl enable networking
+systemctl enable ssh || true
+systemctl enable networking || true
 
-update-initramfs -c -k all
+echo "root:ChangeMeNow!" | chpasswd
+
+mkdir -p /etc/ssh/sshd_config.d
+
+sed -i \
+    's/^#\?PermitRootLogin.*/PermitRootLogin yes/' \
+    /etc/ssh/sshd_config
+
+sed -i \
+    's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' \
+    /etc/ssh/sshd_config
+
+locale-gen en_US.UTF-8 || true
+
+update-initramfs -c -k all || true
+
+apt-get clean
+CHROOT
+}
+
+create_swap() {
+
+    log "Creating ${SWAP_SIZE} swapfile"
+
+    chroot "$TARGET_MOUNT" /bin/bash <<CHROOT
+
+if [ ! -f /swapfile ]; then
+
+    fallocate -l $SWAP_SIZE /swapfile ||
+        dd if=/dev/zero of=/swapfile bs=1M count=4096
+
+    chmod 600 /swapfile
+    mkswap /swapfile
+    swapon /swapfile
+
+fi
 
 CHROOT
 }
 
-
-# ============================================================
-# Configure root password
-# ============================================================
-
-configure_root_password() {
-
-    echo
-    echo "============================================================"
-    echo " Root Password"
-    echo "============================================================"
-    echo
-    echo "Set the root password for the new Ubuntu installation."
-    echo
-
-    local password1
-    local password2
-
-    while true; do
-
-        read -rsp "New root password: " password1
-        echo
-
-        read -rsp "Confirm root password: " password2
-        echo
-
-        if [ -z "$password1" ]; then
-            echo "Password cannot be empty."
-            continue
-        fi
-
-        if [ "$password1" != "$password2" ]; then
-            echo "Passwords do not match."
-            continue
-        fi
-
-        break
-    done
-
-    printf '%s\n%s\n' "$password1" "$password1" |
-        chroot "$TARGET_MOUNT" passwd root
-
-    unset password1
-    unset password2
-}
-
-
-# ============================================================
-# Install GRUB
-# ============================================================
-
 install_grub() {
 
-    echo
-    echo "============================================================"
-    echo " Installing GRUB"
-    echo "============================================================"
+    log "Installing GRUB"
 
     if [ "$BOOT_MODE" = "UEFI" ]; then
 
-        echo "Installing UEFI GRUB..."
+        mkdir -p "$TARGET_MOUNT/boot/efi"
+
+        mount "$EFI_PART" \
+            "$TARGET_MOUNT/boot/efi"
 
         chroot "$TARGET_MOUNT" /bin/bash <<'CHROOT'
-set -Eeuo pipefail
-
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
 export DEBIAN_FRONTEND=noninteractive
-
-apt-get install -y \
-    grub-efi-amd64 \
-    grub-efi-amd64-signed \
-    shim-signed \
-    dosfstools
 
 grub-install \
     --target=x86_64-efi \
     --efi-directory=/boot/efi \
     --bootloader-id=ubuntu \
     --recheck
-
-update-grub
-
 CHROOT
 
     else
 
-        echo "Installing BIOS GRUB..."
-
         chroot "$TARGET_MOUNT" /bin/bash <<CHROOT
-set -Eeuo pipefail
-
-export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-
 export DEBIAN_FRONTEND=noninteractive
-
-apt-get install -y grub-pc
 
 grub-install \
     --target=i386-pc \
     --recheck \
     "$TARGET_DISK"
-
-update-grub
-
 CHROOT
 
     fi
 
-    echo
-    echo "GRUB installation completed."
+    chroot "$TARGET_MOUNT" /bin/bash <<'CHROOT'
+update-grub
+CHROOT
 }
 
+validate_installation() {
 
-# ============================================================
-# Verify installation
-# ============================================================
+    log "Validating installation"
 
-verify_installation() {
+    [ -f "$TARGET_MOUNT/etc/fstab" ] ||
+        die "fstab missing."
 
-    echo
-    echo "============================================================"
-    echo " Installation Verification"
-    echo "============================================================"
+    [ -f "$TARGET_MOUNT/etc/network/interfaces" ] ||
+        die "Network configuration missing."
 
-    echo
-    echo "Boot mode:"
-    echo "$BOOT_MODE"
+    [ -f "$TARGET_MOUNT/boot/vmlinuz-"* ] ||
+        die "Kernel image missing."
 
-    echo
-    echo "Target disk:"
-    echo "$TARGET_DISK"
+    [ -f "$TARGET_MOUNT/boot/initrd.img-"* ] ||
+        die "Initramfs missing."
 
-    echo
-    echo "Root partition:"
-    echo "$ROOT_PART"
+    [ -f "$TARGET_MOUNT/boot/grub/grub.cfg" ] ||
+        die "GRUB configuration missing."
 
-    echo
-    echo "Filesystem:"
-    blkid "$ROOT_PART"
-
-    if [ "$BOOT_MODE" = "UEFI" ]; then
-        echo
-        echo "EFI partition:"
-        echo "$EFI_PART"
-
-        blkid "$EFI_PART"
-    fi
-
-    echo
-    echo "Kernel:"
-    ls -lh "$TARGET_MOUNT"/boot/vmlinuz-* || true
-
-    echo
-    echo "Initramfs:"
-    ls -lh "$TARGET_MOUNT"/boot/initrd.img-* || true
-
-    echo
-    echo "fstab:"
-    cat "$TARGET_MOUNT/etc/fstab"
-
-    echo
-    echo "Network:"
-    cat "$TARGET_MOUNT/etc/network/interfaces"
-
-    echo
-    echo "OS:"
-    cat "$TARGET_MOUNT/etc/os-release"
+    [ -f "$TARGET_MOUNT/etc/ssh/sshd_config" ] ||
+        die "SSH configuration missing."
 
     if [ "$BOOT_MODE" = "UEFI" ]; then
 
-        if [ -d "$TARGET_MOUNT/boot/efi/EFI/ubuntu" ]; then
-            echo
-            echo "[OK] UEFI Ubuntu boot files found."
-        else
-            die "UEFI boot files were not found."
-        fi
+        [ -d "$TARGET_MOUNT/boot/efi/EFI" ] ||
+            die "UEFI boot files missing."
 
     else
 
-        if [ -f "$TARGET_MOUNT/boot/grub/i386-pc/core.img" ]; then
-            echo
-            echo "[OK] BIOS GRUB core.img found."
-        else
-            die "BIOS GRUB core.img was not found."
-        fi
+        [ -f "$TARGET_MOUNT/boot/grub/i386-pc/core.img" ] ||
+            die "BIOS GRUB core.img missing."
+
     fi
 
-    echo
-    echo "Verification completed."
+    echo "Installation validation passed."
 }
 
+show_summary() {
 
-# ============================================================
-# Cleanup
-# ============================================================
+    log "Installation completed"
 
-cleanup() {
-
+    echo "OS          : $OS_NAME"
+    echo "Boot mode   : $BOOT_MODE"
+    echo "Target disk : $TARGET_DISK"
+    echo "Root        : $ROOT_PART"
+    echo "Root UUID   : $ROOT_UUID"
+    echo "Network     : $DEFAULT_IF"
+    echo "IP          : $DEFAULT_IP/$DEFAULT_PREFIX"
+    echo "Gateway     : $DEFAULT_GATEWAY"
     echo
-    echo "Cleaning up..."
-
-    sync
-
-    if [ "$BOOT_MODE" = "UEFI" ]; then
-
-        if mountpoint -q "$TARGET_MOUNT/boot/efi"; then
-            umount "$TARGET_MOUNT/boot/efi" || true
-        fi
-
-    fi
-
-    if mountpoint -q "$TARGET_MOUNT/run"; then
-        umount -R "$TARGET_MOUNT/run" || true
-    fi
-
-    if mountpoint -q "$TARGET_MOUNT/sys"; then
-        umount -R "$TARGET_MOUNT/sys" || true
-    fi
-
-    if mountpoint -q "$TARGET_MOUNT/proc"; then
-        umount -R "$TARGET_MOUNT/proc" || true
-    fi
-
-    if mountpoint -q "$TARGET_MOUNT/dev"; then
-        umount -R "$TARGET_MOUNT/dev" || true
-    fi
-
-    if mountpoint -q "$TARGET_MOUNT"; then
-        umount "$TARGET_MOUNT"
-    fi
-
-    rm -rf "$WORK_DIR"
-
-    sync
-
+    echo "SSH root password:"
     echo
-    echo "Cleanup completed."
+    echo "ChangeMeNow!"
+    echo
+    echo "IMPORTANT: Change the root password after login."
+    echo
 }
 
+main() {
 
-# ============================================================
-# Main
-# ============================================================
-
-clear
-
-echo
-echo "============================================================"
-echo "        UBUNTU 18.04 LTS SERVER INSTALLER"
-echo "============================================================"
-echo
-echo "This installer will erase the selected disk."
-echo
-echo "Target OS : Ubuntu 18.04 LTS"
-echo "Codename  : Bionic"
-echo
-
-check_root
-detect_rescue_os
-detect_boot_mode
-check_tools
-detect_network
-select_target_disk
-check_target_disk
-install_debootstrap
-
-echo
-echo "============================================================"
-echo " FINAL INSTALLATION SUMMARY"
-echo "============================================================"
-echo
-echo "Target disk : $TARGET_DISK"
-echo "Boot mode   : $BOOT_MODE"
-echo "Network     : $DEFAULT_IF"
-echo "IP address  : $DEFAULT_IP/$DEFAULT_PREFIX"
-echo "Gateway     : $DEFAULT_GW"
-echo
-echo "Ubuntu 18.04 will now be installed."
-echo
-
-read -rp "Type INSTALL again to begin disk partitioning: " FINAL_CONFIRM
-
-[ "$FINAL_CONFIRM" = "INSTALL" ] ||
-    die "Installation cancelled."
-
-partition_disk
-mount_target
-run_debootstrap
-bind_mounts
-configure_ubuntu
-configure_root_password
-install_grub
-verify_installation
-
-echo
-echo "============================================================"
-echo " Ubuntu 18.04 Installation Completed"
-echo "============================================================"
-echo
-echo "Target disk : $TARGET_DISK"
-echo "Boot mode   : $BOOT_MODE"
-echo "Network     : $DEFAULT_IF"
-echo "IP          : $DEFAULT_IP"
-echo
-echo "The server is ready to reboot."
-echo
-
-read -rp "Reboot into Ubuntu 18.04 now? [y/N]: " REBOOT_CONFIRM
-
-if [[ "$REBOOT_CONFIRM" =~ ^[Yy]$ ]]; then
-
-    cleanup
+    clear 2>/dev/null || true
 
     echo
-    echo "Rebooting into Ubuntu 18.04..."
-    sleep 3
+    echo "============================================================"
+    echo "        Ubuntu 18.04 LTS Server Installer"
+    echo "============================================================"
+    echo
+    echo "THIS SCRIPT WILL ERASE THE SELECTED DISK."
+    echo
 
-    reboot
+    check_commands
 
-else
+    detect_boot_mode
 
-    cleanup
+    detect_network
+
+    select_target_disk
+
+    install_debootstrap
+
+    partition_disk
+
+    mount_target
+
+    run_debootstrap
+
+    configure_target
+
+    install_packages
+
+    create_swap
+
+    install_grub
+
+    validate_installation
+
+    show_summary
 
     echo
-    echo "Reboot cancelled."
-    echo "You can reboot manually when ready."
-fi
+    read -rp "Reboot into Ubuntu 18.04 now? [y/N]: " confirm
+
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+
+        cleanup
+
+        echo
+        echo "Rebooting in 5 seconds..."
+        sleep 5
+
+        reboot
+
+    else
+
+        cleanup
+
+        echo
+        echo "Reboot cancelled."
+        echo "You can reboot manually."
+    fi
+}
+
+main "$@"
