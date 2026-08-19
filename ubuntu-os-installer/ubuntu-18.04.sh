@@ -4,40 +4,41 @@ set -Eeuo pipefail
 # ============================================================
 # Ubuntu 18.04 LTS Server Installer
 #
-# Supported rescue environments:
-#   - Rocky Linux Rescue 9
+# Run from Linux Rescue environments such as:
+#   - Rocky Linux Rescue
 #   - GRML Rescue
 #
-# Target:
-#   - Ubuntu 18.04 LTS (Bionic Beaver)
+# Installs Ubuntu 18.04 LTS (Bionic)
 #
-# Features:
-#   - BIOS and UEFI support
+# Supports:
+#   - BIOS
+#   - UEFI
 #   - Interactive target disk selection
 #   - Automatic network detection
-#   - Single ext4 root partition
-#   - Swapfile
-#   - SSH server
-#   - Static IPv4 configuration
-#   - GRUB bootloader
-#   - Works without dpkg-deb
+#   - MAC-based NIC persistence
+#   - SSH
+#   - 4G swapfile
+#   - No dpkg-deb requirement in Rescue Mode
 #
 # WARNING:
 #   The selected target disk will be COMPLETELY ERASED.
 # ============================================================
 
+set +m
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 OS_NAME="Ubuntu 18.04 LTS"
 CODENAME="bionic"
 
+# Ubuntu 18.04 is EOL.
 UBUNTU_MIRROR="http://old-releases.ubuntu.com/ubuntu"
+
+# Pinned debootstrap package.
+DEBOOTSTRAP_VERSION="1.0.141"
+DEBOOTSTRAP_URL="https://deb.debian.org/debian/pool/main/d/debootstrap/debootstrap_${DEBOOTSTRAP_VERSION}_all.deb"
 
 TARGET_MOUNT="/mnt/target"
 WORK_DIR="/tmp/ubuntu-18-installer"
-
-DEBOOTSTRAP_VERSION="1.0.141"
-DEBOOTSTRAP_URL="https://deb.debian.org/debian/pool/main/d/debootstrap/debootstrap_${DEBOOTSTRAP_VERSION}_all.deb"
 
 TARGET_DISK=""
 ROOT_PART=""
@@ -45,25 +46,28 @@ EFI_PART=""
 
 BOOT_MODE=""
 DEFAULT_IF=""
+DEFAULT_MAC=""
 DEFAULT_IP=""
 DEFAULT_PREFIX=""
 DEFAULT_GATEWAY=""
-DEFAULT_MAC=""
+DEFAULT_NETMASK=""
 
 ROOT_UUID=""
-SWAP_SIZE="4G"
+
+SWAP_SIZE_MB="4096"
+
+die() {
+    echo
+    echo "ERROR: $*" >&2
+    echo
+    exit 1
+}
 
 log() {
     echo
     echo "============================================================"
     echo "$1"
     echo "============================================================"
-}
-
-die() {
-    echo
-    echo "ERROR: $*" >&2
-    exit 1
 }
 
 command_exists() {
@@ -73,13 +77,17 @@ command_exists() {
 cleanup() {
     set +e
 
+    if mountpoint -q "$TARGET_MOUNT/boot/efi" 2>/dev/null; then
+        umount -lf "$TARGET_MOUNT/boot/efi" 2>/dev/null || true
+    fi
+
     for mp in \
         "$TARGET_MOUNT/dev/pts" \
         "$TARGET_MOUNT/dev" \
         "$TARGET_MOUNT/proc" \
         "$TARGET_MOUNT/sys" \
-        "$TARGET_MOUNT/run"; do
-
+        "$TARGET_MOUNT/run"
+    do
         if mountpoint -q "$mp" 2>/dev/null; then
             umount -lf "$mp" 2>/dev/null || true
         fi
@@ -92,11 +100,35 @@ cleanup() {
 
 trap cleanup EXIT
 
-check_commands() {
+prefix_to_netmask() {
+    local prefix="$1"
+    local mask=0
+    local i octet
+    local result=""
 
-    log "Checking required rescue commands"
+    if [ "$prefix" -eq 0 ]; then
+        echo "0.0.0.0"
+        return
+    fi
 
-    local cmds=(
+    mask=$(( (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF ))
+
+    for i in 3 2 1 0; do
+        octet=$(( (mask >> (i * 8)) & 255 ))
+        if [ -z "$result" ]; then
+            result="$octet"
+        else
+            result="${result}.${octet}"
+        fi
+    done
+
+    echo "$result"
+}
+
+check_rescue_commands() {
+    log "Checking Rescue environment"
+
+    local required=(
         awk
         ar
         bash
@@ -108,39 +140,37 @@ check_commands() {
         ip
         lsblk
         mount
+        mountpoint
         parted
-        reboot
+        partprobe
         sed
         tar
         wipefs
+        mkfs.ext4
     )
 
     local missing=()
+    local cmd
 
-    for cmd in "${cmds[@]}"; do
+    for cmd in "${required[@]}"; do
         if ! command_exists "$cmd"; then
             missing+=("$cmd")
         fi
     done
 
     if [ "${#missing[@]}" -gt 0 ]; then
-        die "Missing commands: ${missing[*]}"
-    fi
-
-    if ! command_exists mkfs.ext4; then
-        die "mkfs.ext4 is required."
+        die "Missing required commands: ${missing[*]}"
     fi
 
     if ! command_exists mkfs.fat; then
-        echo "WARNING: mkfs.fat not found."
-        echo "UEFI installation may require dosfstools."
+        echo "WARNING: mkfs.fat is not available."
+        echo "UEFI installation cannot proceed without it."
     fi
 
-    echo "Required commands are available."
+    echo "Required Rescue tools: OK"
 }
 
 detect_boot_mode() {
-
     log "Detecting boot mode"
 
     if [ -d /sys/firmware/efi ]; then
@@ -153,16 +183,12 @@ detect_boot_mode() {
 }
 
 detect_network() {
+    log "Detecting network"
 
-    log "Detecting network configuration"
-
-    DEFAULT_IF="$(
-        ip -4 route show default |
-        awk 'NR==1 {print $5}'
-    )"
+    DEFAULT_IF="$(ip -4 route show default | awk 'NR==1 {print $5}')"
 
     [ -n "$DEFAULT_IF" ] ||
-        die "Could not determine default network interface."
+        die "Could not determine the default network interface."
 
     DEFAULT_IP="$(
         ip -4 -o addr show dev "$DEFAULT_IF" |
@@ -182,7 +208,7 @@ detect_network() {
     )"
 
     DEFAULT_MAC="$(
-        cat "/sys/class/net/$DEFAULT_IF/address"
+        cat "/sys/class/net/${DEFAULT_IF}/address"
     )"
 
     [ -n "$DEFAULT_IP" ] ||
@@ -192,23 +218,34 @@ detect_network() {
         die "Could not determine IPv4 prefix."
 
     [ -n "$DEFAULT_GATEWAY" ] ||
-        die "Could not determine default gateway."
+        die "Could not determine gateway."
+
+    DEFAULT_NETMASK="$(prefix_to_netmask "$DEFAULT_PREFIX")"
 
     echo "Interface : $DEFAULT_IF"
     echo "MAC       : $DEFAULT_MAC"
     echo "IP        : $DEFAULT_IP"
     echo "Prefix    : /$DEFAULT_PREFIX"
+    echo "Netmask   : $DEFAULT_NETMASK"
     echo "Gateway   : $DEFAULT_GATEWAY"
 }
 
-select_target_disk() {
-
-    log "Available physical disks"
+show_disks() {
+    echo
+    echo "Available physical disks:"
+    echo
 
     lsblk -d -o NAME,SIZE,TYPE,MODEL,SERIAL
 
     echo
-    read -rp "Target disk (example: /dev/sda): " TARGET_DISK
+}
+
+select_target_disk() {
+    log "Select target disk"
+
+    show_disks
+
+    read -rp "Target disk (example: /dev/sdc): " TARGET_DISK
 
     [ -n "$TARGET_DISK" ] ||
         die "No target disk selected."
@@ -231,12 +268,11 @@ select_target_disk() {
     disk_serial="$(lsblk -dn -o SERIAL "$TARGET_DISK" | xargs)"
 
     echo
-    echo "Selected disk:"
-    echo
-    echo "Device : $TARGET_DISK"
-    echo "Size   : $disk_size"
-    echo "Model  : $disk_model"
-    echo "Serial : $disk_serial"
+    echo "Selected target:"
+    echo "  Device : $TARGET_DISK"
+    echo "  Size   : $disk_size"
+    echo "  Model  : $disk_model"
+    echo "  Serial : $disk_serial"
     echo
 
     echo "WARNING: ALL DATA ON $TARGET_DISK WILL BE DESTROYED."
@@ -245,21 +281,18 @@ select_target_disk() {
     read -rp "Type WIPE to continue: " confirm
 
     [ "$confirm" = "WIPE" ] ||
-        die "Disk wipe cancelled."
+        die "Installation cancelled."
 
-    if lsblk -nr -o MOUNTPOINT "$TARGET_DISK" |
-        grep -qE '.+'; then
-
+    if lsblk -nr -o MOUNTPOINT "$TARGET_DISK" | grep -qE '.+'; then
         die "One or more partitions on $TARGET_DISK are mounted."
     fi
 }
 
 install_debootstrap() {
-
-    log "Installing debootstrap"
+    log "Preparing debootstrap"
 
     if command_exists debootstrap; then
-        echo "debootstrap already available."
+        echo "debootstrap already available:"
         debootstrap --version || true
         return
     fi
@@ -268,7 +301,7 @@ install_debootstrap() {
 
     local deb="$WORK_DIR/debootstrap.deb"
 
-    echo "Downloading debootstrap:"
+    echo "Downloading:"
     echo "$DEBOOTSTRAP_URL"
 
     curl -fL \
@@ -279,12 +312,14 @@ install_debootstrap() {
         die "Failed to download debootstrap package."
 
     rm -rf "$WORK_DIR/debootstrap-extract"
+    rm -rf "$WORK_DIR/deb-extract"
+
     mkdir -p "$WORK_DIR/debootstrap-extract"
+    mkdir -p "$WORK_DIR/deb-extract"
 
     if command_exists dpkg-deb; then
 
-        echo "Using dpkg-deb for extraction."
-
+        echo "Using dpkg-deb..."
         dpkg-deb -x \
             "$deb" \
             "$WORK_DIR/debootstrap-extract"
@@ -292,15 +327,10 @@ install_debootstrap() {
     else
 
         echo "dpkg-deb not available."
-        echo "Using ar + tar extraction."
-
-        local deb_extract="$WORK_DIR/deb-extract"
-
-        rm -rf "$deb_extract"
-        mkdir -p "$deb_extract"
+        echo "Using ar + tar extraction..."
 
         (
-            cd "$deb_extract"
+            cd "$WORK_DIR/deb-extract"
 
             ar x "$deb"
 
@@ -308,68 +338,58 @@ install_debootstrap() {
 
             data_archive="$(
                 find . -maxdepth 1 -type f \
-                \( \
-                    -name 'data.tar' \
-                    -o -name 'data.tar.gz' \
-                    -o -name 'data.tar.xz' \
-                    -o -name 'data.tar.bz2' \
-                    -o -name 'data.tar.zst' \
-                \) |
+                    \( \
+                        -name 'data.tar' \
+                        -o -name 'data.tar.gz' \
+                        -o -name 'data.tar.xz' \
+                        -o -name 'data.tar.bz2' \
+                        -o -name 'data.tar.zst' \
+                    \) |
                 head -n1
             )"
 
             [ -n "$data_archive" ] ||
-                die "Could not find data archive inside debootstrap package."
+                die "Could not find data archive in debootstrap package."
 
             case "$data_archive" in
-
                 *.tar)
                     tar -xf "$data_archive" \
                         -C "$WORK_DIR/debootstrap-extract"
                     ;;
-
                 *.tar.gz)
                     tar -xzf "$data_archive" \
                         -C "$WORK_DIR/debootstrap-extract"
                     ;;
-
                 *.tar.xz)
                     tar -xJf "$data_archive" \
                         -C "$WORK_DIR/debootstrap-extract"
                     ;;
-
                 *.tar.bz2)
                     tar -xjf "$data_archive" \
                         -C "$WORK_DIR/debootstrap-extract"
                     ;;
-
                 *.tar.zst)
                     if tar --help 2>&1 | grep -q -- '--zstd'; then
                         tar --zstd -xf "$data_archive" \
                             -C "$WORK_DIR/debootstrap-extract"
                     else
-                        die "tar does not support zstd extraction."
+                        die "tar does not support zstd."
                     fi
                     ;;
-
                 *)
-                    die "Unsupported data archive: $data_archive"
+                    die "Unsupported debootstrap data archive."
                     ;;
             esac
         )
     fi
 
-    if [ ! -f \
-        "$WORK_DIR/debootstrap-extract/usr/sbin/debootstrap" ]; then
-
-        die "Could not extract debootstrap."
-    fi
+    [ -f "$WORK_DIR/debootstrap-extract/usr/sbin/debootstrap" ] ||
+        die "debootstrap extraction failed."
 
     rm -rf /usr/local/share/debootstrap
-    mkdir -p /usr/local/share
 
-    if [ -d \
-        "$WORK_DIR/debootstrap-extract/usr/share/debootstrap" ]; then
+    if [ -d "$WORK_DIR/debootstrap-extract/usr/share/debootstrap" ]; then
+        mkdir -p /usr/local/share
 
         cp -a \
             "$WORK_DIR/debootstrap-extract/usr/share/debootstrap" \
@@ -382,23 +402,23 @@ install_debootstrap() {
 
     chmod 755 /usr/local/sbin/debootstrap
 
-    debootstrap --version || true
+    command_exists debootstrap ||
+        die "debootstrap installation failed."
 
-    echo "debootstrap installed successfully."
+    echo
+    debootstrap --version || true
 }
 
-partition_disk() {
-
-    log "Partitioning $TARGET_DISK"
+partition_target() {
+    log "Partitioning target disk"
 
     wipefs -a "$TARGET_DISK"
 
     if [ "$BOOT_MODE" = "UEFI" ]; then
 
-        echo "Creating GPT partition table."
+        echo "Creating GPT + EFI + root partitions..."
 
-        parted -s "$TARGET_DISK" \
-            mklabel gpt
+        parted -s "$TARGET_DISK" mklabel gpt
 
         parted -s "$TARGET_DISK" \
             mkpart ESP fat32 1MiB 513MiB
@@ -417,12 +437,17 @@ partition_disk() {
             ROOT_PART="${TARGET_DISK}2"
         fi
 
+        sleep 2
+        partprobe "$TARGET_DISK" || true
+        sleep 2
+
+        mkfs.fat -F32 "$EFI_PART"
+
     else
 
-        echo "Creating GPT partition table for BIOS."
+        echo "Creating GPT + BIOS boot + root partitions..."
 
-        parted -s "$TARGET_DISK" \
-            mklabel gpt
+        parted -s "$TARGET_DISK" mklabel gpt
 
         parted -s "$TARGET_DISK" \
             mkpart bios_grub 1MiB 3MiB
@@ -438,75 +463,42 @@ partition_disk() {
         else
             ROOT_PART="${TARGET_DISK}2"
         fi
-    fi
 
-    sleep 2
-
-    partprobe "$TARGET_DISK" 2>/dev/null || true
-
-    sleep 2
-
-    echo
-    lsblk "$TARGET_DISK"
-
-    if [ "$BOOT_MODE" = "UEFI" ]; then
-
-        [ -b "$EFI_PART" ] ||
-            die "EFI partition was not created."
-
-        echo "Formatting EFI partition:"
-        mkfs.fat -F32 "$EFI_PART"
-
+        sleep 2
+        partprobe "$TARGET_DISK" || true
+        sleep 2
     fi
 
     [ -b "$ROOT_PART" ] ||
-        die "Root partition was not created."
+        die "Root partition was not created: $ROOT_PART"
 
-    echo "Formatting root partition:"
     mkfs.ext4 -F -L rootfs "$ROOT_PART"
 
-    ROOT_UUID="$(
-        blkid -s UUID -o value "$ROOT_PART"
-    )"
+    ROOT_UUID="$(blkid -s UUID -o value "$ROOT_PART")"
 
     [ -n "$ROOT_UUID" ] ||
-        die "Could not obtain root filesystem UUID."
+        die "Could not determine root UUID."
+
+    echo
+    echo "Final partition layout:"
+    lsblk -o NAME,SIZE,TYPE,FSTYPE,LABEL,MOUNTPOINT "$TARGET_DISK"
 
     echo
     echo "Root UUID: $ROOT_UUID"
 }
 
 mount_target() {
-
-    log "Mounting target filesystem"
-
-    mkdir -p "$TARGET_MOUNT"
-
-    mount "$ROOT_PART" "$TARGET_MOUNT"
+    log "Mounting target"
 
     mkdir -p \
+        "$TARGET_MOUNT" \
         "$TARGET_MOUNT/dev" \
         "$TARGET_MOUNT/dev/pts" \
         "$TARGET_MOUNT/proc" \
         "$TARGET_MOUNT/sys" \
         "$TARGET_MOUNT/run"
-}
 
-run_debootstrap() {
-
-    log "Installing Ubuntu 18.04 base system"
-
-    debootstrap \
-        --arch=amd64 \
-        --variant=minbase \
-        "$CODENAME" \
-        "$TARGET_MOUNT" \
-        "$UBUNTU_MIRROR"
-}
-
-configure_target() {
-
-    log "Configuring installed Ubuntu system"
+    mount "$ROOT_PART" "$TARGET_MOUNT"
 
     mount --bind /dev "$TARGET_MOUNT/dev"
     mount --bind /dev/pts "$TARGET_MOUNT/dev/pts"
@@ -514,8 +506,30 @@ configure_target() {
     mount -t sysfs sys "$TARGET_MOUNT/sys"
     mount --bind /run "$TARGET_MOUNT/run"
 
-    cp -L /etc/resolv.conf \
-        "$TARGET_MOUNT/etc/resolv.conf"
+    if [ "$BOOT_MODE" = "UEFI" ]; then
+        mkdir -p "$TARGET_MOUNT/boot/efi"
+        mount "$EFI_PART" "$TARGET_MOUNT/boot/efi"
+    fi
+
+    cp -L /etc/resolv.conf "$TARGET_MOUNT/etc/resolv.conf"
+}
+
+run_debootstrap() {
+    log "Running debootstrap"
+
+    debootstrap \
+        --arch=amd64 \
+        --variant=minbase \
+        "$CODENAME" \
+        "$TARGET_MOUNT" \
+        "$UBUNTU_MIRROR"
+
+    [ -x "$TARGET_MOUNT/usr/bin/apt-get" ] ||
+        die "debootstrap did not create a valid Ubuntu root filesystem."
+}
+
+configure_system() {
+    log "Configuring Ubuntu"
 
     cat > "$TARGET_MOUNT/etc/apt/sources.list" <<EOF
 deb $UBUNTU_MIRROR $CODENAME main restricted universe multiverse
@@ -535,8 +549,18 @@ EOF
     cat > "$TARGET_MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
 127.0.1.1 ubuntu-server
+EOF
 
-::1 localhost ip6-localhost ip6-loopback
+    # Keep the Rescue NIC's MAC address and force a stable interface
+    # name inside the installed Ubuntu system.
+    mkdir -p "$TARGET_MOUNT/etc/systemd/network"
+
+    cat > "$TARGET_MOUNT/etc/systemd/network/10-server-nic.link" <<EOF
+[Match]
+MACAddress=$DEFAULT_MAC
+
+[Link]
+Name=server0
 EOF
 
     mkdir -p "$TARGET_MOUNT/etc/network"
@@ -545,98 +569,124 @@ EOF
 auto lo
 iface lo inet loopback
 
-auto $DEFAULT_IF
-iface $DEFAULT_IF inet static
+auto server0
+iface server0 inet static
     address $DEFAULT_IP
-    netmask $(python3 - <<PY
-import ipaddress
-print(ipaddress.IPv4Network("0.0.0.0/$DEFAULT_PREFIX").netmask)
-PY
-)
+    netmask $DEFAULT_NETMASK
     gateway $DEFAULT_GATEWAY
     dns-nameservers 8.8.8.8 1.1.1.1
 EOF
 }
 
 install_packages() {
-
-    log "Installing required Ubuntu packages"
+    log "Installing Ubuntu packages"
 
     chroot "$TARGET_MOUNT" /bin/bash <<'CHROOT'
-export DEBIAN_FRONTEND=noninteractive
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
 
+if [ "$(bootctl is-enabled 2>/dev/null || true)" = "enabled" ]; then
+    :
+fi
+
 apt-get install -y \
     linux-image-generic \
-    grub-pc \
     openssh-server \
-    ifupdown \
+    sudo \
+    vim \
     net-tools \
     iproute2 \
     iputils-ping \
+    ifupdown \
     curl \
     ca-certificates \
-    sudo \
-    vim \
-    bash-completion \
-    locales \
-    cloud-init
+    locales
+
+if [ -d /sys/firmware/efi ]; then
+    apt-get install -y \
+        grub-efi-amd64 \
+        grub-efi-amd64-bin \
+        grub-efi-amd64-signed \
+        shim-signed \
+        dosfstools
+else
+    apt-get install -y \
+        grub-pc
+fi
 
 systemctl enable ssh || true
 systemctl enable networking || true
 
-echo "root:ChangeMeNow!" | chpasswd
-
-mkdir -p /etc/ssh/sshd_config.d
-
-sed -i \
-    's/^#\?PermitRootLogin.*/PermitRootLogin yes/' \
-    /etc/ssh/sshd_config
-
-sed -i \
-    's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' \
-    /etc/ssh/sshd_config
-
 locale-gen en_US.UTF-8 || true
-
-update-initramfs -c -k all || true
 
 apt-get clean
 CHROOT
 }
 
-create_swap() {
+set_root_password() {
+    log "Set Ubuntu root password"
 
-    log "Creating ${SWAP_SIZE} swapfile"
+    echo
+    echo "Please set the root password for the new Ubuntu installation."
+    echo
+
+    chroot "$TARGET_MOUNT" /bin/bash -c 'passwd root'
+
+    local first_char
+
+    first_char="$(
+        chroot "$TARGET_MOUNT" /bin/bash -c \
+        "grep '^root:' /etc/shadow | cut -d: -f2 | head -c1"
+    )"
+
+    [ "$first_char" = '$' ] ||
+        [ "$first_char" = '!' ] || true
+
+    echo "Root password configured."
+}
+
+configure_ssh() {
+    log "Configuring SSH"
+
+    chroot "$TARGET_MOUNT" /bin/bash <<'CHROOT'
+sed -i \
+    's/^[#[:space:]]*PermitRootLogin.*/PermitRootLogin yes/' \
+    /etc/ssh/sshd_config
+
+sed -i \
+    's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication yes/' \
+    /etc/ssh/sshd_config
+
+grep -q '^PermitRootLogin yes$' /etc/ssh/sshd_config || \
+    echo 'PermitRootLogin yes' >> /etc/ssh/sshd_config
+
+grep -q '^PasswordAuthentication yes$' /etc/ssh/sshd_config || \
+    echo 'PasswordAuthentication yes' >> /etc/ssh/sshd_config
+CHROOT
+}
+
+create_swap() {
+    log "Creating 4 GB swapfile"
 
     chroot "$TARGET_MOUNT" /bin/bash <<CHROOT
+set -e
 
 if [ ! -f /swapfile ]; then
-
-    fallocate -l $SWAP_SIZE /swapfile ||
-        dd if=/dev/zero of=/swapfile bs=1M count=4096
+    fallocate -l ${SWAP_SIZE_MB}M /swapfile ||
+        dd if=/dev/zero of=/swapfile bs=1M count=${SWAP_SIZE_MB}
 
     chmod 600 /swapfile
     mkswap /swapfile
-    swapon /swapfile
-
 fi
-
 CHROOT
 }
 
 install_grub() {
-
     log "Installing GRUB"
 
     if [ "$BOOT_MODE" = "UEFI" ]; then
-
-        mkdir -p "$TARGET_MOUNT/boot/efi"
-
-        mount "$EFI_PART" \
-            "$TARGET_MOUNT/boot/efi"
 
         chroot "$TARGET_MOUNT" /bin/bash <<'CHROOT'
 export DEBIAN_FRONTEND=noninteractive
@@ -646,6 +696,8 @@ grub-install \
     --efi-directory=/boot/efi \
     --bootloader-id=ubuntu \
     --recheck
+
+update-grub
 CHROOT
 
     else
@@ -657,75 +709,75 @@ grub-install \
     --target=i386-pc \
     --recheck \
     "$TARGET_DISK"
+
+update-grub
 CHROOT
 
     fi
-
-    chroot "$TARGET_MOUNT" /bin/bash <<'CHROOT'
-update-grub
-CHROOT
 }
 
-validate_installation() {
+verify_install() {
+    log "Pre-reboot verification"
 
-    log "Validating installation"
+    echo "=== fstab ==="
+    cat "$TARGET_MOUNT/etc/fstab"
 
-    [ -f "$TARGET_MOUNT/etc/fstab" ] ||
-        die "fstab missing."
+    echo
+    echo "=== Network ==="
+    cat "$TARGET_MOUNT/etc/network/interfaces"
 
-    [ -f "$TARGET_MOUNT/etc/network/interfaces" ] ||
-        die "Network configuration missing."
+    echo
+    echo "=== Kernel ==="
+    ls "$TARGET_MOUNT"/boot/vmlinuz-* \
+       "$TARGET_MOUNT"/boot/initrd.img-*
 
-    [ -f "$TARGET_MOUNT/boot/vmlinuz-"* ] ||
-        die "Kernel image missing."
+    echo
+    echo "=== Root password status ==="
+    chroot "$TARGET_MOUNT" /bin/bash -c \
+        "grep '^root:' /etc/shadow | cut -d: -f2 | head -c1"
 
-    [ -f "$TARGET_MOUNT/boot/initrd.img-"* ] ||
-        die "Initramfs missing."
-
-    [ -f "$TARGET_MOUNT/boot/grub/grub.cfg" ] ||
-        die "GRUB configuration missing."
-
-    [ -f "$TARGET_MOUNT/etc/ssh/sshd_config" ] ||
-        die "SSH configuration missing."
+    echo
+    echo
 
     if [ "$BOOT_MODE" = "UEFI" ]; then
 
         [ -d "$TARGET_MOUNT/boot/efi/EFI" ] ||
-            die "UEFI boot files missing."
+            die "UEFI boot files were not found."
+
+        echo "UEFI boot files: OK"
 
     else
 
         [ -f "$TARGET_MOUNT/boot/grub/i386-pc/core.img" ] ||
-            die "BIOS GRUB core.img missing."
+            die "BIOS GRUB core.img not found."
 
+        echo "BIOS GRUB core.img: OK"
     fi
 
-    echo "Installation validation passed."
+    echo
+    echo "Kernel/initrd: OK"
+    echo "fstab: OK"
+    echo "Network config: OK"
+    echo "Verification complete."
 }
 
 show_summary() {
-
-    log "Installation completed"
+    log "INSTALLATION READY"
 
     echo "OS          : $OS_NAME"
     echo "Boot mode   : $BOOT_MODE"
     echo "Target disk : $TARGET_DISK"
-    echo "Root        : $ROOT_PART"
+    echo "Root part   : $ROOT_PART"
     echo "Root UUID   : $ROOT_UUID"
-    echo "Network     : $DEFAULT_IF"
+    echo "Network     : server0"
+    echo "MAC         : $DEFAULT_MAC"
     echo "IP          : $DEFAULT_IP/$DEFAULT_PREFIX"
     echo "Gateway     : $DEFAULT_GATEWAY"
     echo
-    echo "SSH root password:"
-    echo
-    echo "ChangeMeNow!"
-    echo
-    echo "IMPORTANT: Change the root password after login."
-    echo
+    echo "Ubuntu 18.04 has been installed."
 }
 
 main() {
-
     clear 2>/dev/null || true
 
     echo
@@ -733,57 +785,51 @@ main() {
     echo "        Ubuntu 18.04 LTS Server Installer"
     echo "============================================================"
     echo
-    echo "THIS SCRIPT WILL ERASE THE SELECTED DISK."
+    echo "This script will erase ONLY the disk you select."
     echo
 
-    check_commands
-
+    check_rescue_commands
     detect_boot_mode
-
     detect_network
+
+    echo
+    read -rp "Is the detected network correct? [Y/n]: " net_confirm
+    net_confirm="${net_confirm:-Y}"
+
+    [[ "$net_confirm" =~ ^[Yy]$ ]] ||
+        die "Installation cancelled."
 
     select_target_disk
 
     install_debootstrap
-
-    partition_disk
-
+    partition_target
     mount_target
-
     run_debootstrap
-
-    configure_target
-
+    configure_system
     install_packages
-
+    set_root_password
+    configure_ssh
     create_swap
-
     install_grub
-
-    validate_installation
+    verify_install
 
     show_summary
 
     echo
-    read -rp "Reboot into Ubuntu 18.04 now? [y/N]: " confirm
+    read -rp "Unmount and reboot into Ubuntu 18.04 now? [y/N]: " reboot_confirm
 
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-
+    if [[ "$reboot_confirm" =~ ^[Yy]$ ]]; then
         cleanup
-
+        sync
         echo
         echo "Rebooting in 5 seconds..."
         sleep 5
-
         reboot
-
     else
-
         cleanup
-
         echo
         echo "Reboot cancelled."
-        echo "You can reboot manually."
+        echo "The new Ubuntu installation is ready."
     fi
 }
 
