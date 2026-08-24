@@ -85,7 +85,7 @@ if [ "$CONFIRM" != "YES" ]; then
 fi
 
 # --------------------------------------------------
-# 3. Disk Wipe and Partitioning
+# 3. Disk Wipe and Partitioning (GPT vs MBR)
 # --------------------------------------------------
 echo "--> Unmounting existing target mounts..."
 umount -R /mnt/target 2>/dev/null || true
@@ -96,7 +96,7 @@ dd if=/dev/zero of="$TARGET_DISK" bs=1M count=10 status=none
 sync
 
 if [ "$DISK_SIZE_BYTES" -gt "$TWO_TB_BYTES" ]; then
-    echo "--> Disk >2TB detected. Creating GPT Partition Scheme..."
+    echo "--> Disk >2TB detected ($DISK_SIZE_BYTES bytes). Creating GPT Partition Scheme..."
     parted -s "$TARGET_DISK" mklabel gpt
     parted -s "$TARGET_DISK" mkpart primary 1MiB 3MiB
     parted -s "$TARGET_DISK" set 1 bios_grub on
@@ -105,8 +105,8 @@ if [ "$DISK_SIZE_BYTES" -gt "$TWO_TB_BYTES" ]; then
     BOOT_PART="${PART_PREFIX}1"
     ROOT_PART="${PART_PREFIX}2"
 else
-    echo "--> Disk <2TB detected. Creating standard MBR Partition Scheme..."
-    parted -s "$TARGET_DISK" mklabel mdos
+    echo "--> Disk <=2TB detected ($DISK_SIZE_BYTES bytes). Creating MBR Partition Scheme..."
+    parted -s "$TARGET_DISK" mklabel msdos
     parted -s "$TARGET_DISK" mkpart primary xfs 1MiB 100%
     parted -s "$TARGET_DISK" set 1 boot on
     
