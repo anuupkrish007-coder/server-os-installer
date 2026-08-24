@@ -85,7 +85,7 @@ if [ "$CONFIRM" != "YES" ]; then
 fi
 
 # --------------------------------------------------
-# 3. Disk Wipe and Partitioning (GPT for >2TB support)
+# 3. Disk Wipe and Partitioning
 # --------------------------------------------------
 echo "--> Unmounting existing target mounts..."
 umount -R /mnt/target 2>/dev/null || true
@@ -142,7 +142,7 @@ gpgcheck=0
 enabled=1
 EOF
 
-echo "--> Installing AlmaLinux 8 Core Packages (this may take 2-4 minutes)..."
+echo "--> Installing AlmaLinux 8 Core Packages..."
 dnf --installroot=/mnt/target -c /tmp/almaconf/almalinux.repo \
     --releasever=8 --setopt=install_weak_deps=False -y \
     groupinstall "Minimal Install"
@@ -176,7 +176,7 @@ SUBSYSTEM=="net", ACTION=="add", DRIVERS=="?*", ATTR{address}=="${MAC_ADDR}", NA
 EOF
 fi
 
-# Create AlmaLinux legacy ifcfg network script for instant compatibility
+# Create legacy ifcfg script for network compatibility
 mkdir -p /mnt/target/etc/sysconfig/network-scripts
 cat <<EOF > /mnt/target/etc/sysconfig/network-scripts/ifcfg-${DETECTED_IFACE}
 TYPE=Ethernet
@@ -203,18 +203,29 @@ UUID=${ROOT_UUID}  /  xfs  defaults  0  0
 EOF
 
 # --------------------------------------------------
-# 6. Chroot Configuration (GRUB, Password, SSH)
+# 6. Chroot Configuration (GRUB, Password, SSH & SELinux)
 # --------------------------------------------------
 echo "--> Executing Chroot Setup..."
 chroot /mnt/target /bin/bash -s <<EOF
 set -e
 
+# Disable SELinux enforcement to prevent SSH drops on bootstrapped setups
+if [ -f /etc/selinux/config ]; then
+    sed -i 's/SELINUX=.*/SELINUX=permissive/' /etc/selinux/config
+fi
+touch /.autorelabel
+
 # Enable Root SSH Login
 sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 sed -i 's/PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
-# Set Root Password
-echo "${ROOT_PASS}" | passwd --stdin root
+# Set Root Password using chpasswd
+echo "root:${ROOT_PASS}" | chpasswd
+
+# Generate SSH Host Keys and fix permissions
+ssh-keygen -A
+chmod 600 /etc/ssh/ssh_host_*_key 2>/dev/null || true
+chmod 644 /etc/ssh/ssh_host_*_key.pub 2>/dev/null || true
 
 # Enable NetworkManager and SSH
 systemctl enable NetworkManager
