@@ -7,13 +7,30 @@ echo "  Target: 1x NVMe (OS) + Pass-Through Raw HDDs"
 echo "===================================================="
 
 # --------------------------------------------------
-# 1. Environment & Tools Check
+# 1. Environment & Package Manager Detection
 # --------------------------------------------------
-REQUIRED_TOOLS=("parted" "debootstrap" "mkfs.ext4" "gdisk" "ip")
+echo "--> Checking host environment package manager..."
+if command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR="apt"
+elif command -v dnf >/dev/null 2>&1; then
+    PKG_MGR="dnf"
+elif command -v yum >/dev/null 2>&1; then
+    PKG_MGR="yum"
+else
+    echo "ERROR: Unknown package manager on rescue environment!"
+    exit 1
+fi
+
+REQUIRED_TOOLS=("parted" "debootstrap" "gdisk" "ip")
 for tool in "${REQUIRED_TOOLS[@]}"; do
-    if ! command -v $tool >/dev/null 2>&1; then
+    if ! command -v "$tool" >/dev/null 2>&1; then
         echo "--> Installing missing tool: $tool..."
-        apt-get update -qq && apt-get install -y -qq parted debootstrap gdisk net-tools iproute2 || true
+        if [ "$PKG_MGR" = "apt" ]; then
+            apt-get update -qq && apt-get install -y -qq "$tool" net-tools iproute2 || true
+        else
+            $PKG_MGR install -y epel-release 2>/dev/null || true
+            $PKG_MGR install -y "$tool" net-tools iproute 2>/dev/null || true
+        fi
     fi
 done
 
@@ -38,7 +55,6 @@ echo "--> Active Network Routes:"
 ip route
 
 echo ""
-# Auto-detect Network Interface
 DETECTED_IFACE=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || true)
 if [ -z "$DETECTED_IFACE" ]; then
     DETECTED_IFACE=$(ip route | grep default | grep -oP 'dev \K\S+' | head -n1)
@@ -46,7 +62,7 @@ fi
 
 MAC_ADDR=$(cat /sys/class/net/${DETECTED_IFACE}/address 2>/dev/null || true)
 
-read -rp "Enter OS NVMe Disk Name (e.g., nvme0n1 or sda): " NVME_INPUT
+read -rp "Enter OS Disk Name (e.g., sdb or nvme0n1): " NVME_INPUT
 NVME_INPUT=$(echo "$NVME_INPUT" | sed 's|^/dev/||')
 NVME_DISK="/dev/${NVME_INPUT}"
 
@@ -55,7 +71,7 @@ if [ ! -b "$NVME_DISK" ]; then
     exit 1
 fi
 
-echo "Enter HDD names to wipe partition tables for pass-through (separated by space, e.g., sda sdb sdc sdd):"
+echo "Enter HDD names to wipe partition tables for pass-through (separated by space, e.g., sda sdc sdd):"
 read -rp "> " -a HDD_INPUTS
 
 HDD_DISKS=()
@@ -80,7 +96,7 @@ echo "===================================================="
 echo " Summary of Installation Settings:"
 echo " OS:              Debian 11 (Bullseye)"
 echo " Boot Mode:       $( [ $IS_EFI -eq 1 ] && echo 'UEFI' || echo 'Legacy BIOS' )"
-echo " OS NVMe Drive:   $NVME_DISK"
+echo " OS Drive:        $NVME_DISK"
 echo " Pass-Through:    ${HDD_DISKS[*]} (Unformatted / Raw)"
 echo " Interface:       $DETECTED_IFACE ($MAC_ADDR)"
 echo " Hostname:        $HOSTNAME"
@@ -96,16 +112,15 @@ if [ "$CONFIRM" != "YES" ]; then
 fi
 
 # --------------------------------------------------
-# 3. Partition NVMe (Hybrid EFI + BIOS GPT Layout)
+# 3. Partition Target Drive
 # --------------------------------------------------
 echo "--> Unmounting existing target mounts..."
 umount -R /mnt/target 2>/dev/null || true
 swapoff -a 2>/dev/null || true
 
-echo "--> Wiping partition headers on NVMe..."
+echo "--> Wiping partition headers on OS Disk..."
 dd if=/dev/zero of="$NVME_DISK" bs=1M count=20 status=none
 
-# Wipe partition signatures on HDDs so customer gets clean raw drives
 for hdd in "${HDD_DISKS[@]}"; do
     echo "--> Wiping signature on raw drive $hdd..."
     dd if=/dev/zero of="$hdd" bs=1M count=20 status=none
@@ -113,49 +128,65 @@ for hdd in "${HDD_DISKS[@]}"; do
 done
 sync
 
-# Partitioning prefix logic (nvme0n1p1 vs sda1)
 if [[ "$NVME_INPUT" =~ [0-9]$ ]]; then
     NVME_PART_PREFIX="${NVME_DISK}p"
 else
     NVME_PART_PREFIX="${NVME_DISK}"
 fi
 
-echo "--> Setting up Hybrid GPT Scheme on $NVME_DISK..."
+echo "--> Setting up GPT Scheme on $NVME_DISK..."
 parted -s "$NVME_DISK" mklabel gpt
 
-# Partition 1: BIOS Boot Partition (2MB for GRUB Legacy)
-parted -s "$NVME_DISK" mkpart primary 1MiB 3MiB
-parted -s "$NVME_DISK" set 1 bios_grub on
+if [ $IS_EFI -eq 1 ]; then
+    # EFI Partitioning
+    parted -s "$NVME_DISK" mkpart primary fat32 1MiB 513MiB
+    parted -s "$NVME_DISK" set 1 esp on
 
-# Partition 2: EFI System Partition (512MB for GRUB UEFI)
-parted -s "$NVME_DISK" mkpart primary fat32 3MiB 515MiB
-parted -s "$NVME_DISK" set 2 esp on
+    parted -s "$NVME_DISK" mkpart primary linux-swap 513MiB 33281MiB
+    parted -s "$NVME_DISK" mkpart primary ext4 33281MiB 100%
 
-# Partition 3: Swap (32GB)
-parted -s "$NVME_DISK" mkpart primary linux-swap 515MiB 33299MiB
+    partprobe "$NVME_DISK"
+    sleep 2
 
-# Partition 4: OS Root / (Remaining space)
-parted -s "$NVME_DISK" mkpart primary ext4 33299MiB 100%
+    EFI_PART="${NVME_PART_PREFIX}1"
+    SWAP_PART="${NVME_PART_PREFIX}2"
+    ROOT_PART="${NVME_PART_PREFIX}3"
 
-partprobe "$NVME_DISK"
-sleep 2
+    echo "--> Formatting partitions..."
+    mkfs.vfat -F32 "$EFI_PART"
+    mkswap "$SWAP_PART"
+    swapon "$SWAP_PART"
+    mkfs.ext4 -F "$ROOT_PART"
 
-BIOS_PART="${NVME_PART_PREFIX}1"
-EFI_PART="${NVME_PART_PREFIX}2"
-SWAP_PART="${NVME_PART_PREFIX}3"
-ROOT_PART="${NVME_PART_PREFIX}4"
+    echo "--> Mounting OS Root filesystem..."
+    mkdir -p /mnt/target
+    mount "$ROOT_PART" /mnt/target
+    mkdir -p /mnt/target/boot/efi
+    mount "$EFI_PART" /mnt/target/boot/efi
+else
+    # Legacy BIOS Partitioning
+    parted -s "$NVME_DISK" mkpart primary 1MiB 3MiB
+    parted -s "$NVME_DISK" set 1 bios_grub on
 
-echo "--> Formatting NVMe partitions..."
-mkfs.vfat -F32 "$EFI_PART"
-mkswap "$SWAP_PART"
-swapon "$SWAP_PART"
-mkfs.ext4 -F "$ROOT_PART"
+    parted -s "$NVME_DISK" mkpart primary linux-swap 3MiB 32771MiB
+    parted -s "$NVME_DISK" mkpart primary ext4 32771MiB 100%
 
-echo "--> Mounting OS Root filesystem..."
-mkdir -p /mnt/target
-mount "$ROOT_PART" /mnt/target
-mkdir -p /mnt/target/boot/efi
-mount "$EFI_PART" /mnt/target/boot/efi
+    partprobe "$NVME_DISK"
+    sleep 2
+
+    BIOS_PART="${NVME_PART_PREFIX}1"
+    SWAP_PART="${NVME_PART_PREFIX}2"
+    ROOT_PART="${NVME_PART_PREFIX}3"
+
+    echo "--> Formatting partitions..."
+    mkswap "$SWAP_PART"
+    swapon "$SWAP_PART"
+    mkfs.ext4 -F "$ROOT_PART"
+
+    echo "--> Mounting OS Root filesystem..."
+    mkdir -p /mnt/target
+    mount "$ROOT_PART" /mnt/target
+fi
 
 # --------------------------------------------------
 # 4. Debootstrap Debian 11 (Bullseye) Core
@@ -179,7 +210,6 @@ cat <<EOF > /mnt/target/etc/hosts
 $IP_ADDR   $HOSTNAME
 EOF
 
-# Interface configuration (/etc/network/interfaces)
 mkdir -p /mnt/target/etc/network
 cat <<EOF > /mnt/target/etc/network/interfaces
 auto lo
@@ -193,18 +223,23 @@ iface ${DETECTED_IFACE} inet static
     dns-nameservers 1.1.1.1 8.8.8.8
 EOF
 
-# FSTAB configuration (NVMe OS only)
 ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
-EFI_UUID=$(blkid -s UUID -o value "$EFI_PART")
 SWAP_UUID=$(blkid -s UUID -o value "$SWAP_PART")
 
-cat <<EOF > /mnt/target/etc/fstab
+if [ $IS_EFI -eq 1 ]; then
+    EFI_UUID=$(blkid -s UUID -o value "$EFI_PART")
+    cat <<EOF > /mnt/target/etc/fstab
 UUID=${ROOT_UUID}   /              ext4    errors=remount-ro,noatime 0 1
 UUID=${EFI_UUID}    /boot/efi      vfat    umask=0077                0 2
 UUID=${SWAP_UUID}   none           swap    sw                        0 0
 EOF
+else
+    cat <<EOF > /mnt/target/etc/fstab
+UUID=${ROOT_UUID}   /              ext4    errors=remount-ro,noatime 0 1
+UUID=${SWAP_UUID}   none           swap    sw                        0 0
+EOF
+fi
 
-# Apt Sources List for Debian 11 Bullseye
 cat <<EOF > /mnt/target/etc/apt/sources.list
 deb http://deb.debian.org/debian/ bullseye main contrib non-free
 deb-src http://deb.debian.org/debian/ bullseye main contrib non-free
@@ -226,8 +261,22 @@ set -e
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -y
-apt-get install -y linux-image-amd64 linux-headers-amd64 firmware-linux-free firmware-linux-nonfree \
-    openssh-server curl wget sudo net-tools grub-pc grub-efi-amd64
+
+if [ $IS_EFI -eq 1 ]; then
+    echo "--> Installing UEFI packages..."
+    apt-get install -y linux-image-amd64 linux-headers-amd64 firmware-linux-free firmware-linux-nonfree \
+        openssh-server curl wget sudo net-tools grub-efi-amd64
+    
+    grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Debian --recheck
+else
+    echo "--> Installing Legacy BIOS packages..."
+    apt-get install -y linux-image-amd64 linux-headers-amd64 firmware-linux-free firmware-linux-nonfree \
+        openssh-server curl wget sudo net-tools grub-pc
+    
+    grub-install --target=i386-pc "$NVME_DISK"
+fi
+
+update-grub
 
 # Enable Root SSH Login
 sed -i 's/#PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
@@ -235,15 +284,6 @@ sed -i 's/PermitRootLogin.*/PermitRootLogin yes/' /etc/ssh/sshd_config
 
 # Set Root Password
 echo "root:${ROOT_PASS}" | chpasswd
-
-# Install Dual GRUB Bootloaders (Hybrid BIOS + UEFI support)
-echo "--> Installing GRUB for Legacy BIOS..."
-grub-install --target=i386-pc "$NVME_DISK" || true
-
-echo "--> Installing GRUB for UEFI..."
-grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=Debian --recheck || true
-
-update-grub
 
 systemctl enable ssh
 EOF
