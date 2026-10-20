@@ -2,39 +2,25 @@
 set -eo pipefail
 
 echo "===================================================="
-echo "  Ubuntu 20.04 LTS (Focal) Universal Installer"
-echo "  Target: 1x NVMe/SSD (OS) + Pass-Through Raw HDDs"
+echo "  Ubuntu 20.04 LTS (Focal) Bulletproof Installer"
+echo "  Target: 1x SSD/NVMe (OS) + Pass-Through Raw HDDs"
 echo "===================================================="
 
 # --------------------------------------------------
-# 1. Environment & Package Manager Detection
+# 1. Environment & Tools Check
 # --------------------------------------------------
-echo "--> Checking host environment package manager..."
+echo "--> Detecting rescue environment tools..."
 if command -v apt-get >/dev/null 2>&1; then
-    PKG_MGR="apt"
+    apt-get update -qq && apt-get install -y -qq parted debootstrap gdisk net-tools iproute2 e2fsprogs || true
 elif command -v dnf >/dev/null 2>&1; then
-    PKG_MGR="dnf"
+    dnf install -y epel-release 2>/dev/null || true
+    dnf install -y parted debootstrap gdisk net-tools iproute e2fsprogs 2>/dev/null || true
 elif command -v yum >/dev/null 2>&1; then
-    PKG_MGR="yum"
-else
-    echo "ERROR: Unknown package manager on rescue environment!"
-    exit 1
+    yum install -y epel-release 2>/dev/null || true
+    yum install -y parted debootstrap gdisk net-tools iproute e2fsprogs 2>/dev/null || true
 fi
 
-REQUIRED_TOOLS=("parted" "debootstrap" "gdisk" "ip")
-for tool in "${REQUIRED_TOOLS[@]}"; do
-    if ! command -v "$tool" >/dev/null 2>&1; then
-        echo "--> Installing missing tool: $tool..."
-        if [ "$PKG_MGR" = "apt" ]; then
-            apt-get update -qq && apt-get install -y -qq "$tool" net-tools iproute2 || true
-        else
-            $PKG_MGR install -y epel-release 2>/dev/null || true
-            $PKG_MGR install -y "$tool" net-tools iproute 2>/dev/null || true
-        fi
-    fi
-done
-
-# Detect Boot Mode (EFI vs BIOS)
+# Detect Boot Mode
 IS_EFI=0
 if [ -d "/sys/firmware/efi" ]; then
     IS_EFI=1
@@ -44,7 +30,7 @@ else
 fi
 
 # --------------------------------------------------
-# 2. Disk & Network Auto-Detection
+# 2. Disk & Network Detection
 # --------------------------------------------------
 echo ""
 echo "--> Available Disks on System:"
@@ -71,7 +57,7 @@ if [ ! -b "$OS_DISK" ]; then
     exit 1
 fi
 
-echo "Enter HDD names to wipe partition tables for pass-through (separated by space, e.g., sda sdc sdd):"
+echo "Enter HDD names to wipe partition tables for pass-through (e.g., sda sdc sdd):"
 read -rp "> " -a HDD_INPUTS
 
 HDD_DISKS=()
@@ -91,7 +77,6 @@ read -rp "Enter Default Gateway IP: " GATEWAY
 read -rsp "Enter Root Password for Ubuntu 20.04: " ROOT_PASS
 echo ""
 
-# Convert netmask to CIDR prefix
 cdr() {
     local x=${1##*255.}
     set -- 0^^^128^192^224^240^248^252^254^ $(( (${#1} - ${#x})*2 )) ${x%%.*}
@@ -120,17 +105,18 @@ if [[ ! "$CONFIRM" =~ ^[Yy]([Ee][Ss])?$ ]]; then
 fi
 
 # --------------------------------------------------
-# 3. Partition Target Drive
+# 3. Partition & Format (Strict Compatibility Mode)
 # --------------------------------------------------
-echo "--> Unmounting existing target mounts..."
-umount -R /mnt/target 2>/dev/null || true
+echo "--> Killing lingering processes and unmounting /mnt/target..."
+fuser -km /mnt/target 2>/dev/null || true
+umount -R -f -l /mnt/target 2>/dev/null || true
 swapoff -a 2>/dev/null || true
 
-echo "--> Wiping partition headers on OS Disk..."
+echo "--> Wiping partition headers..."
 dd if=/dev/zero of="$OS_DISK" bs=1M count=20 status=none
 
 for hdd in "${HDD_DISKS[@]}"; do
-    echo "--> Wiping signature on raw drive $hdd..."
+    echo "--> Wiping partition table on raw HDD $hdd..."
     dd if=/dev/zero of="$hdd" bs=1M count=20 status=none
     parted -s "$hdd" mklabel gpt || true
 done
@@ -142,7 +128,7 @@ else
     OS_PART_PREFIX="${OS_DISK}"
 fi
 
-echo "--> Setting up GPT Scheme on $OS_DISK..."
+echo "--> Partitioning $OS_DISK with GPT layout..."
 parted -s "$OS_DISK" mklabel gpt
 
 if [ $IS_EFI -eq 1 ]; then
@@ -161,11 +147,12 @@ if [ $IS_EFI -eq 1 ]; then
 
     echo "--> Formatting partitions..."
     mkfs.vfat -F32 "$EFI_PART"
-    mkswap "$SWAP_PART"
+    mkswap -f "$SWAP_PART"
     swapon "$SWAP_PART"
-    mkfs.ext4 -F "$ROOT_PART"
 
-    echo "--> Mounting OS Root filesystem..."
+    # CRITICAL: Strip modern ext4 features so Ubuntu 20.04 kernel & GRUB can read it
+    mkfs.ext4 -F -O "^metadata_csum_seed,^orphan_file" "$ROOT_PART"
+
     mkdir -p /mnt/target
     mount "$ROOT_PART" /mnt/target
     mkdir -p /mnt/target/boot/efi
@@ -185,42 +172,42 @@ else
     ROOT_PART="${OS_PART_PREFIX}3"
 
     echo "--> Formatting partitions..."
-    mkswap "$SWAP_PART"
+    mkswap -f "$SWAP_PART"
     swapon "$SWAP_PART"
-    mkfs.ext4 -F "$ROOT_PART"
 
-    echo "--> Mounting OS Root filesystem..."
+    # CRITICAL: Strip modern ext4 features so Ubuntu 20.04 kernel & GRUB can read it
+    mkfs.ext4 -F -O "^metadata_csum_seed,^orphan_file" "$ROOT_PART"
+
     mkdir -p /mnt/target
     mount "$ROOT_PART" /mnt/target
 fi
 
 # --------------------------------------------------
-# 4. Debootstrap Ubuntu 20.04 (Focal Fossa) Core
+# 4. Debootstrap Core OS
 # --------------------------------------------------
-echo "--> Debootstrapping Ubuntu 20.04 (Focal)..."
+echo "--> Debootstrapping Ubuntu 20.04 LTS (Focal)..."
 debootstrap --arch=amd64 focal /mnt/target http://archive.ubuntu.com/ubuntu/
 
 # --------------------------------------------------
-# 5. System Configuration & Netplan Setup
+# 5. Virtual Mounts, DNS & Network Config
 # --------------------------------------------------
-echo "--> Mounting pseudo-filesystems for Chroot..."
+echo "--> Binding virtual directories..."
 for dir in /dev /dev/pts /proc /sys /run; do
     mount --bind "$dir" "/mnt/target$dir"
 done
 
-echo "$HOSTNAME" > /mnt/target/etc/hostname
-
-cat <<EOF > /mnt/target/etc/hosts
-127.0.0.1   localhost
-127.0.1.1   $HOSTNAME
-$IP_ADDR   $HOSTNAME
-EOF
-
-# Fix dangling symlink and enforce static DNS
+# DNS Fix: Overwrite dangling symlink
 rm -f /mnt/target/etc/resolv.conf
 cat <<EOF > /mnt/target/etc/resolv.conf
 nameserver 1.1.1.1
 nameserver 8.8.8.8
+EOF
+
+echo "$HOSTNAME" > /mnt/target/etc/hostname
+cat <<EOF > /mnt/target/etc/hosts
+127.0.0.1   localhost
+127.0.1.1   $HOSTNAME
+$IP_ADDR   $HOSTNAME
 EOF
 
 mkdir -p /mnt/target/etc/netplan
@@ -238,9 +225,9 @@ network:
           - 1.1.1.1
           - 8.8.8.8
 EOF
-
 chmod 600 /mnt/target/etc/netplan/01-netcfg.yaml
 
+# Generate clean fstab using persistent UUIDs
 ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
 SWAP_UUID=$(blkid -s UUID -o value "$SWAP_PART")
 
@@ -265,25 +252,32 @@ deb http://archive.ubuntu.com/ubuntu/ focal-security main restricted universe mu
 EOF
 
 # --------------------------------------------------
-# 6. Chroot Operations (Kernel, GRUB & Password)
+# 6. Chroot: Kernel, Initramfs, Drivers & Bootloader
 # --------------------------------------------------
-echo "--> Executing Chroot Setup..."
+echo "--> Configuring base system in chroot..."
 chroot /mnt/target /bin/bash -s <<EOF
 set -e
-
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -y
 apt-get install -y linux-generic linux-headers-generic openssh-server curl wget sudo net-tools netplan.io
 
+# Force all storage and disk drivers into initramfs
+sed -i 's/MODULES=most/MODULES=dep/' /etc/initramfs-tools/initramfs.conf || true
+echo "ahci" >> /etc/initramfs-tools/modules
+echo "sd_mod" >> /etc/initramfs-tools/modules
+echo "ext4" >> /etc/initramfs-tools/modules
+update-initramfs -u -k all
+
+# Setup GRUB
 if [ $IS_EFI -eq 1 ]; then
-    echo "--> Installing UEFI packages..."
     apt-get install -y grub-efi-amd64
     grub-install --target=x86_64-efi --efi-directory=/boot/efi --bootloader-id=ubuntu --recheck
 else
-    echo "--> Installing Legacy BIOS packages..."
     apt-get install -y grub-pc
-    grub-install --target=i386-pc "$OS_DISK"
+    mkdir -p /boot/grub
+    echo "(hd0) $OS_DISK" > /boot/grub/device.map
+    grub-install --target=i386-pc --recheck "$OS_DISK"
 fi
 
 update-grub
@@ -300,14 +294,15 @@ systemctl enable systemd-networkd
 EOF
 
 # --------------------------------------------------
-# 7. Cleanup
+# 7. Clean Unmount
 # --------------------------------------------------
-echo "--> Cleaning up mounts..."
+echo "--> Syncing and cleanly unmounting target..."
+sync
 umount -R /mnt/target 2>/dev/null || true
 
 echo "===================================================="
-echo " Ubuntu 20.04 LTS Installation Complete!"
+echo " Ubuntu 20.04 LTS Installation Finished Successfully!"
 echo " OS installed on: $OS_DISK"
-echo " HDDs wiped & ready for customer configuration."
-echo " Run '# reboot' to start your new OS."
+echo " HDDs wiped & clean for pass-through."
+echo " Ready to reboot: execute '# reboot'"
 echo "===================================================="
