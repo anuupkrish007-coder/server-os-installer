@@ -2,7 +2,7 @@
 set -eo pipefail
 
 echo "===================================================="
-echo "  Ubuntu 20.04 LTS (Focal) Installer (NVMe OS Only)"
+echo "  Ubuntu 20.04 LTS (Focal) Universal Installer"
 echo "  Target: 1x NVMe/SSD (OS) + Pass-Through Raw HDDs"
 echo "===================================================="
 
@@ -112,9 +112,9 @@ echo " Hostname:        $HOSTNAME"
 echo " IP Address:      $IP_ADDR/${CIDR_PREFIX}"
 echo " Gateway:         $GATEWAY"
 echo "===================================================="
-read -rp "WARNING: ALL DATA ON OS DISK ($OS_DISK) AND HDDs WILL BE ERASED! Proceed? (type YES): " CONFIRM
+read -rp "WARNING: ALL DATA ON OS DISK ($OS_DISK) AND HDDs WILL BE ERASED! Proceed? (y/N): " CONFIRM
 
-if [ "$CONFIRM" != "YES" ]; then
+if [[ ! "$CONFIRM" =~ ^[Yy]([Ee][Ss])?$ ]]; then
     echo "Aborted."
     exit 1
 fi
@@ -146,7 +146,6 @@ echo "--> Setting up GPT Scheme on $OS_DISK..."
 parted -s "$OS_DISK" mklabel gpt
 
 if [ $IS_EFI -eq 1 ]; then
-    # EFI Partitioning
     parted -s "$OS_DISK" mkpart primary fat32 1MiB 513MiB
     parted -s "$OS_DISK" set 1 esp on
 
@@ -172,7 +171,6 @@ if [ $IS_EFI -eq 1 ]; then
     mkdir -p /mnt/target/boot/efi
     mount "$EFI_PART" /mnt/target/boot/efi
 else
-    # Legacy BIOS Partitioning
     parted -s "$OS_DISK" mkpart primary 1MiB 3MiB
     parted -s "$OS_DISK" set 1 bios_grub on
 
@@ -218,7 +216,13 @@ cat <<EOF > /mnt/target/etc/hosts
 $IP_ADDR   $HOSTNAME
 EOF
 
-# Ubuntu 20.04 uses Netplan
+# Fix dangling symlink and enforce static DNS
+rm -f /mnt/target/etc/resolv.conf
+cat <<EOF > /mnt/target/etc/resolv.conf
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+
 mkdir -p /mnt/target/etc/netplan
 cat <<EOF > /mnt/target/etc/netplan/01-netcfg.yaml
 network:
@@ -254,7 +258,6 @@ UUID=${SWAP_UUID}   none           swap    sw                        0 0
 EOF
 fi
 
-# Ubuntu Official Repositories
 cat <<EOF > /mnt/target/etc/apt/sources.list
 deb http://archive.ubuntu.com/ubuntu/ focal main restricted universe multiverse
 deb http://archive.ubuntu.com/ubuntu/ focal-updates main restricted universe multiverse
