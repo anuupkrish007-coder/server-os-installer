@@ -70,9 +70,9 @@ else
     ROOT_PART="${OS_DISK}1"
 fi
 
-# 3. Format filesystem
-echo "--> Formatting $ROOT_PART (ext4 compatible)..."
-mkfs.ext4 -F -O "^metadata_csum_seed,^orphan_file" "$ROOT_PART"
+# 3. Format filesystem (Standard ext4 for e2fsprogs 1.46.x)
+echo "--> Formatting $ROOT_PART..."
+mkfs.ext4 -F "$ROOT_PART"
 
 mkdir -p /mnt/target
 mount "$ROOT_PART" /mnt/target
