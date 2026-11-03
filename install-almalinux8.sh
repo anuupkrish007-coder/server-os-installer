@@ -2,20 +2,22 @@
 set -eo pipefail
 
 echo "===================================================="
-echo "  AlmaLinux 8 Native Installer (via Rocky Rescue)"
+echo "  Universal AlmaLinux 8 Installer (Rescue Mode)"
 echo "===================================================="
 
-# Ensure required deployment tools exist on Rocky host
-dnf install -y parted e2fsprogs iproute curl
+# 1. Install prerequisites on host
+if command -v dnf >/dev/null 2>&1; then
+    dnf install -y parted e2fsprogs iproute curl
+elif command -v yum >/dev/null 2>&1; then
+    yum install -y parted e2fsprogs iproute curl
+fi
 
-# Active network auto-detection
 ACTIVE_IFACE=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'dev \K\S+' || ip route | grep default | grep -oP 'dev \K\S+' | head -n1)
 MAC_ADDR=$(cat /sys/class/net/${ACTIVE_IFACE}/address 2>/dev/null || true)
 
-echo "--> Detected Active Interface: $ACTIVE_IFACE ($MAC_ADDR)"
+echo "--> Detected Network Interface: $ACTIVE_IFACE ($MAC_ADDR)"
 lsblk -d -o NAME,SIZE,TYPE,MODEL,SERIAL
 
-# Inputs
 read -rp "Enter target disk name [default: sda]: " OS_INPUT
 OS_INPUT=${OS_INPUT:-sda}
 OS_INPUT=$(echo "$OS_INPUT" | sed 's|^/dev/||')
@@ -36,7 +38,6 @@ GATEWAY=${GATEWAY:-83.149.120.190}
 read -rsp "Enter Root Password for New OS: " ROOT_PASS
 echo ""
 
-# Convert netmask to CIDR prefix
 cdr() {
     local x=${1##*255.}
     set -- 0^^^128^192^224^240^248^252^254^ $(( (${#1} - ${#x})*2 )) ${x%%.*}
@@ -51,13 +52,11 @@ if [[ "$CONFIRM" != "YES" ]]; then
     exit 1
 fi
 
-# 1. Unmount existing partitions
-echo "--> Unmounting existing mounts..."
+echo "--> Cleaning up target mounts..."
 fuser -km /mnt/target 2>/dev/null || true
 umount -R -f -l /mnt/target 2>/dev/null || true
 
-# 2. Partition disk (MBR for BIOS boot)
-echo "--> Partitioning $OS_DISK with MBR layout..."
+echo "--> Partitioning $OS_DISK (MBR layout)..."
 dd if=/dev/zero of="$OS_DISK" bs=1M count=20 status=none
 parted -s "$OS_DISK" mklabel msdos
 parted -s "$OS_DISK" mkpart primary ext4 1MiB 100%
@@ -70,15 +69,13 @@ else
     ROOT_PART="${OS_DISK}1"
 fi
 
-# 3. Format filesystem (Standard ext4 for e2fsprogs 1.46.x)
 echo "--> Formatting $ROOT_PART..."
 mkfs.ext4 -F "$ROOT_PART"
 
 mkdir -p /mnt/target
 mount "$ROOT_PART" /mnt/target
 
-# 4. Bootstrap AlmaLinux 8 release packages & repository
-echo "--> Bootstrapping AlmaLinux 8 release repositories..."
+echo "--> Configuring bootstrap repositories..."
 mkdir -p /mnt/target/etc/yum.repos.d
 cat << 'REPO_EOF' > /tmp/almalinux8-bootstrap.repo
 [baseos]
@@ -94,22 +91,28 @@ enabled=1
 gpgcheck=0
 REPO_EOF
 
-# 5. Native DNF Installroot
-echo "--> Installing AlmaLinux 8 Core Packages via native DNF..."
+echo "--> Bootstrapping base packages..."
 dnf -y --config=/tmp/almalinux8-bootstrap.repo \
        --installroot=/mnt/target \
        --releasever=8 \
        --setopt=install_weak_deps=False \
        install almalinux-release basesystem bash coreutils dnf \
-               kernel grub2-pc grub2-tools openssh-server NetworkManager iproute passwd
+               kernel grub2-pc grub2-tools openssh-server NetworkManager iproute \
+               passwd hostname
 
-# 6. Mount pseudo-filesystems for chroot
+# Pin releasever inside the installation to avoid future mirror issues
+mkdir -p /mnt/target/etc/dnf/vars
+echo "8" > /mnt/target/etc/dnf/vars/releasever
+
+# Copy default profile files so bash-4.4# prompt doesn't occur
+cp /mnt/target/etc/skel/.bash* /mnt/target/root/ 2>/dev/null || true
+
 echo "--> Binding virtual filesystems..."
 for dir in /dev /dev/pts /proc /sys /run; do
     mount --bind "$dir" "/mnt/target$dir"
 done
 
-# 7. DNS & Hostname
+# DNS & Hostname
 rm -f /mnt/target/etc/resolv.conf
 cat <<RESOLV > /mnt/target/etc/resolv.conf
 nameserver 1.1.1.1
@@ -118,7 +121,7 @@ RESOLV
 
 echo "$HOSTNAME" > /mnt/target/etc/hostname
 
-# 8. Network configuration (ifcfg)
+# Static Network Config
 mkdir -p /mnt/target/etc/sysconfig/network-scripts
 cat <<NETCFG > /mnt/target/etc/sysconfig/network-scripts/ifcfg-${ACTIVE_IFACE}
 DEVICE=${ACTIVE_IFACE}
@@ -131,14 +134,20 @@ DNS1=1.1.1.1
 DNS2=8.8.8.8
 NETCFG
 
-# 9. Persistent fstab
+# Hosts entry
+cat <<HOSTS > /mnt/target/etc/hosts
+127.0.0.1   localhost localhost.localdomain
+::1         localhost localhost.localdomain
+${IP_ADDR}  ${HOSTNAME} ${HOSTNAME%%.*}
+HOSTS
+
+# Persistent Fstab
 ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
 cat <<FSTAB > /mnt/target/etc/fstab
 UUID=${ROOT_UUID}  /  ext4  defaults,noatime  0 1
 FSTAB
 
-# 10. Chroot: GRUB, SSH, and Services
-echo "--> Configuring bootloader and services in chroot..."
+echo "--> Finalizing bootloader and credentials in chroot..."
 chroot /mnt/target /bin/bash -s <<CHROOT_EOF
 set -e
 
@@ -155,12 +164,10 @@ systemctl enable NetworkManager
 systemctl enable sshd
 CHROOT_EOF
 
-# 11. Sync and clean unmount
-echo "--> Unmounting target..."
 sync
 umount -R /mnt/target 2>/dev/null || true
 
 echo "===================================================="
 echo "  AlmaLinux 8 Installation Complete!"
-echo "  Run 'reboot' to boot into AlmaLinux 8."
+echo "  Run 'reboot' to boot into the new OS."
 echo "===================================================="
